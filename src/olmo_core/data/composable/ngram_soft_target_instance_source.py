@@ -82,21 +82,12 @@ class NgramSoftTargetInstanceSource(InstanceSource):
             raise ValueError(
                 f"unigram_shortlist ({self._unigram_shortlist}) must be >= K ({self._K})"
             )
-        # Eager init in the main (rank) process: this mmap's the tables AND
-        # triggers a sequential page-cache warm-up inside _NgramTable.__init__.
-        # DataLoader workers that spawn later on the same node will re-mmap
-        # the same files (via _get_lookup) and hit the already-warm OS page
-        # cache — so only the first process per node pays the Weka-read cost,
-        # and the hot-path random-access probes are DDR-speed for every
-        # process thereafter.
-        from olmo_core.data.ngram_soft_target import NgramTableSoftTargetSource
-
-        self._lookup: NgramTableSoftTargetSource | None = NgramTableSoftTargetSource(
-            table_dir=self._table_dir,
-            K=self._K,
-            N_max=self._N_max,
-            unigram_shortlist=self._unigram_shortlist,
-        )
+        # Lazy per-process init. _NgramTable.__init__ takes care of mirroring
+        # remote (weka) table files to /dev/shm once per node with a file
+        # lock, so whichever process hits __getitem__ first on a node pays
+        # the sequential copy cost; everyone else attaches to the cached
+        # tmpfs mirror.
+        self._lookup = None
 
     @property
     def source(self) -> InstanceSource:
@@ -113,23 +104,6 @@ class NgramSoftTargetInstanceSource(InstanceSource):
     @property
     def N_max(self) -> int:
         return self._N_max
-
-    def __getstate__(self):
-        """Exclude the live ``_lookup`` (which holds numpy memmap arrays over
-        the 45 GB table files) from pickle. Workers receiving this source via
-        DataLoader spawn will unpickle with ``_lookup=None`` and then
-        re-initialise it lazily on first ``__getitem__`` via
-        :meth:`_get_lookup`. That re-init mmaps the same files again; the
-        main process's eager-init step has already warmed the OS page cache
-        on this node, so the worker's sequential warm-scan is a cache-hit
-        walk rather than a weka pull.
-        """
-        state = self.__dict__.copy()
-        state["_lookup"] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
 
     def _get_lookup(self):
         if self._lookup is None:

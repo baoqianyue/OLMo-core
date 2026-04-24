@@ -54,9 +54,14 @@ Status
 
 from __future__ import annotations
 
+import fcntl
+import hashlib as _hashlib_for_paths
 import math
 import os
+import shutil
 import struct
+import sys
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -142,9 +147,99 @@ def _fixup_hash_key(h: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+_SHM_CACHE_ROOT = Path(
+    os.environ.get("OLMO_CORE_NGRAM_TABLE_SHM_ROOT", "/dev/shm/ngram_table_cache")
+)
+# File-system prefixes we treat as "remote" and mirror to /dev/shm before use.
+# Weka mounts live at /weka/...; extend this list if we ever add other remotes.
+_REMOTE_PREFIXES = ("/weka/",)
+
+
+def _mirror_to_shm(path: str) -> str:
+    """Sequential-copy ``path`` into a tmpfs (``/dev/shm``) mirror once, return
+    the mirror path. Thread/process-safe via an ``fcntl.flock`` so that
+    concurrent ranks/workers cooperate — the first arrival does the copy,
+    everyone else blocks on the lock, finds the file already cached, and
+    returns the mirror path immediately.
+
+    The point: ``/dev/shm`` is tmpfs (RAM-backed). Once the mirror exists,
+    all processes on this node that later ``np.memmap`` the mirror path
+    hit pages that already live in RAM via the OS page cache — random-access
+    probes are DDR-speed, with zero further weka I/O.
+
+    If ``path`` isn't on a remote filesystem (Weka), returns it unchanged.
+    If the tmpfs copy already exists with the right size, returns it without
+    recopying. The cache root is configurable via the
+    ``OLMO_CORE_NGRAM_TABLE_SHM_ROOT`` env var (default ``/dev/shm/ngram_table_cache``).
+    """
+    if not any(path.startswith(p) for p in _REMOTE_PREFIXES):
+        return path
+
+    src_size = os.path.getsize(path)
+    # Derive a stable cache filename from the source path so that two
+    # different source files with the same basename can't collide.
+    path_hash = _hashlib_for_paths.sha1(path.encode("utf-8")).hexdigest()[:12]
+    cache_dir = _SHM_CACHE_ROOT / path_hash
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / Path(path).name
+
+    # Fast path: cache already exists and is the right size.
+    try:
+        if cache_path.is_file() and cache_path.stat().st_size == src_size:
+            return str(cache_path)
+    except OSError:
+        pass
+
+    # Slow path: take an exclusive lock and copy. Other processes that arrive
+    # concurrently will block here and find the cache populated when they
+    # acquire the lock in turn.
+    lock_path = str(cache_path) + ".lock"
+    with open(lock_path, "w") as lock_f:
+        fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        # Re-check under the lock — another process may have populated the
+        # cache while we were waiting.
+        if cache_path.is_file() and cache_path.stat().st_size == src_size:
+            return str(cache_path)
+        tmp_path = Path(str(cache_path) + ".partial")
+        try:
+            t0 = time.time()
+            mb = src_size / 1_000_000
+            print(
+                f"[ngram_soft_target] mirroring {path} ({mb:.0f} MB) "
+                f"→ {cache_path} ...",
+                file=sys.stderr,
+                flush=True,
+            )
+            # Sequential chunked copy. shutil.copyfile uses a large block size
+            # under the hood (64 KB default, bumped to 16 MB on modern Python
+            # for performance); we use copyfileobj with an explicit 32 MB
+            # buffer to keep weka-side reads large and contiguous.
+            with open(path, "rb") as src, open(tmp_path, "wb") as dst:
+                shutil.copyfileobj(src, dst, length=32 * 1024 * 1024)
+            # Rename atomically into place — ensures partially-copied files
+            # never expose themselves to concurrent readers.
+            tmp_path.replace(cache_path)
+            elapsed = time.time() - t0
+            print(
+                f"[ngram_soft_target] mirrored {Path(path).name} in {elapsed:.1f}s "
+                f"({mb/max(elapsed, 1e-9):.0f} MB/s)",
+                file=sys.stderr,
+                flush=True,
+            )
+        except BaseException:
+            # Clean up the partial file so a retry can start fresh.
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+    return str(cache_path)
+
+
 class _NgramTable:
-    """Memory-mapped view of a single ``ngram_table_n<N>.bin`` file, with
-    page-cache pre-warming.
+    """Memory-mapped view of a single ``ngram_table_n<N>.bin`` file, mirrored
+    to tmpfs (/dev/shm) on first access if sourced from remote storage.
 
     Keeps three numpy views into a single np.memmap:
 
@@ -155,25 +250,20 @@ class _NgramTable:
     A prefix's continuations live at ``tokens[off:off+n]`` and
     ``probs[off:off+n]`` where (off, n) come from its slot.
 
-    Why memmap + warm (vs np.memmap alone, vs loading fully into user RAM):
-
-    * **memmap alone**: the hot-path probe does ~millions of random-access
-      slot reads per microbatch. If the tables are on Weka (network-attached),
-      each cold page fault costs ~0.1–1 ms and training grinds for 10+ min
-      per batch.
-    * **loading into user RAM** (np.fromfile into bytes): solves the hot-path
-      problem but each process gets its own 45 GB copy. DataLoader workers
-      that spawn (the PyTorch default on Linux when CUDA is initialised) each
-      re-read the file independently, multiplying both RAM use and Weka
-      contention.
-    * **memmap + warm** (this impl): the main process reads every page once
-      at init time via a sequential scan. The OS page cache on the node is
-      now hot. DataLoader workers on the same node mmap the same file and
-      get page-cache hits for free — one physical 45 GB of RAM shared across
-      every process, and zero weka page faults on the hot path.
+    Why tmpfs mirror: hot-path probes do ~millions of random-access reads per
+    microbatch. Mmap'ing a Weka file directly means each page fault triggers
+    a network read — minutes of stall per batch. Mirroring to ``/dev/shm``
+    (which IS the OS page cache, RAM-backed) means the backing pages are in
+    RAM from the start; every process on the node mmap's the same local file
+    and shares one physical 45 GB via the kernel page cache. Random access
+    is DDR speed. The only slow I/O is the one-time sequential copy from
+    weka → tmpfs, guarded by a file lock so concurrent ranks cooperate.
     """
 
     def __init__(self, path: str):
+        # Mirror remote (weka) files to /dev/shm on first touch so all
+        # subsequent mmap's are RAM-backed. No-op for already-local paths.
+        path = _mirror_to_shm(path)
         self.path = path
         with open(path, "rb") as f:
             header = f.read(_HEADER_SIZE)
@@ -211,13 +301,6 @@ class _NgramTable:
         self.probs = np.frombuffer(
             self._mm, dtype=np.float16, count=self.total_continuations, offset=probs_off
         )
-
-        # Warm the OS page cache with a sequential scan. Sequential reads of
-        # an mmap'd file are fast even from Weka (hundreds of MB/s). Once
-        # cached, random-access probes on the hot path are DDR-speed. Sum
-        # forces every byte to be read; the result is assigned to _ to
-        # prevent lazy evaluation.
-        _ = int(self._mm.sum(dtype=np.uint64))
 
     def probe(self, prefix_tokens: tuple[int, ...]) -> Optional[Tuple[int, int, float]]:
         """Return (num_cont, cont_offset, backoff_log10), or None on miss.
