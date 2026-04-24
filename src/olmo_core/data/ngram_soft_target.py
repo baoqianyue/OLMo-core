@@ -143,9 +143,10 @@ def _fixup_hash_key(h: int) -> int:
 
 
 class _NgramTable:
-    """Fully RAM-resident view of a single ``ngram_table_n<N>.bin`` file.
+    """Memory-mapped view of a single ``ngram_table_n<N>.bin`` file, with
+    page-cache pre-warming.
 
-    Keeps three numpy views over regions read sequentially into RAM:
+    Keeps three numpy views into a single np.memmap:
 
     - ``slots[capacity]`` — the Robin-Hood-probed hash table
     - ``tokens[total_cont]`` — all continuation token IDs, flat
@@ -154,59 +155,69 @@ class _NgramTable:
     A prefix's continuations live at ``tokens[off:off+n]`` and
     ``probs[off:off+n]`` where (off, n) come from its slot.
 
-    Why RAM-resident (vs np.memmap): with tables on Weka (network-attached
-    storage), per-probe page faults take ~0.1–1 ms each, and one training
-    microbatch does millions of random-access probes. That's 10+ min of pure
-    I/O per batch on a cold page cache. Sequentially reading the whole file
-    into RAM at init time is ~10 s per table on a warm Weka and then every
-    subsequent probe is a DDR access (~100 ns).
+    Why memmap + warm (vs np.memmap alone, vs loading fully into user RAM):
 
-    Total RAM for the pilot-v4 1e-3 table set is ~45 GB. On H100 nodes with
-    1.5 TB RAM, comfortable. If the DataLoader spawns workers via fork (the
-    PyTorch default on Linux), the numpy array bytes are shared CoW with
-    the main process — so we pay ~45 GB once, not per-worker.
+    * **memmap alone**: the hot-path probe does ~millions of random-access
+      slot reads per microbatch. If the tables are on Weka (network-attached),
+      each cold page fault costs ~0.1–1 ms and training grinds for 10+ min
+      per batch.
+    * **loading into user RAM** (np.fromfile into bytes): solves the hot-path
+      problem but each process gets its own 45 GB copy. DataLoader workers
+      that spawn (the PyTorch default on Linux when CUDA is initialised) each
+      re-read the file independently, multiplying both RAM use and Weka
+      contention.
+    * **memmap + warm** (this impl): the main process reads every page once
+      at init time via a sequential scan. The OS page cache on the node is
+      now hot. DataLoader workers on the same node mmap the same file and
+      get page-cache hits for free — one physical 45 GB of RAM shared across
+      every process, and zero weka page faults on the hot path.
     """
 
     def __init__(self, path: str):
         self.path = path
         with open(path, "rb") as f:
             header = f.read(_HEADER_SIZE)
-            if len(header) < _HEADER_SIZE:
-                raise ValueError(f"{path}: header short ({len(header)} bytes)")
-            (
-                magic,
-                version,
-                order,
-                capacity,
-                total_cont,
-                load_factor,
-                slots_off,
-                tokens_off,
-                probs_off,
-            ) = struct.unpack("<4sIIQQfQQQ", header[:56])
-            if magic != _MAGIC:
-                raise ValueError(f"{path}: magic {magic!r} != expected {_MAGIC!r}")
-            if version != _VERSION:
-                raise ValueError(f"{path}: version {version} != expected {_VERSION}")
-            self.order = int(order)
-            self.capacity = int(capacity)
-            self.capacity_mask = int(capacity - 1)
-            self.total_continuations = int(total_cont)
-            self.load_factor = float(load_factor)
+        if len(header) < _HEADER_SIZE:
+            raise ValueError(f"{path}: header short ({len(header)} bytes)")
+        (
+            magic,
+            version,
+            order,
+            capacity,
+            total_cont,
+            load_factor,
+            slots_off,
+            tokens_off,
+            probs_off,
+        ) = struct.unpack("<4sIIQQfQQQ", header[:56])
+        if magic != _MAGIC:
+            raise ValueError(f"{path}: magic {magic!r} != expected {_MAGIC!r}")
+        if version != _VERSION:
+            raise ValueError(f"{path}: version {version} != expected {_VERSION}")
+        self.order = int(order)
+        self.capacity = int(capacity)
+        self.capacity_mask = int(capacity - 1)
+        self.total_continuations = int(total_cont)
+        self.load_factor = float(load_factor)
 
-            # Read each region sequentially into RAM-backed numpy arrays. np.fromfile
-            # is much faster than memmap + copy because it uses a single large read
-            # system call per region.
-            f.seek(slots_off)
-            slots_bytes = f.read(self.capacity * _SLOT_DTYPE.itemsize)
-            f.seek(tokens_off)
-            tokens_bytes = f.read(self.total_continuations * 4)
-            f.seek(probs_off)
-            probs_bytes = f.read(self.total_continuations * 2)
+        file_size = os.path.getsize(path)
+        self._mm = np.memmap(path, dtype=np.uint8, mode="r", shape=(file_size,))
+        self.slots = np.frombuffer(
+            self._mm, dtype=_SLOT_DTYPE, count=self.capacity, offset=slots_off
+        )
+        self.tokens = np.frombuffer(
+            self._mm, dtype=np.uint32, count=self.total_continuations, offset=tokens_off
+        )
+        self.probs = np.frombuffer(
+            self._mm, dtype=np.float16, count=self.total_continuations, offset=probs_off
+        )
 
-        self.slots = np.frombuffer(slots_bytes, dtype=_SLOT_DTYPE)
-        self.tokens = np.frombuffer(tokens_bytes, dtype=np.uint32)
-        self.probs = np.frombuffer(probs_bytes, dtype=np.float16)
+        # Warm the OS page cache with a sequential scan. Sequential reads of
+        # an mmap'd file are fast even from Weka (hundreds of MB/s). Once
+        # cached, random-access probes on the hot path are DDR-speed. Sum
+        # forces every byte to be read; the result is assigned to _ to
+        # prevent lazy evaluation.
+        _ = int(self._mm.sum(dtype=np.uint64))
 
     def probe(self, prefix_tokens: tuple[int, ...]) -> Optional[Tuple[int, int, float]]:
         """Return (num_cont, cont_offset, backoff_log10), or None on miss.

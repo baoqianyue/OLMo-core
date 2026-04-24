@@ -82,14 +82,16 @@ class NgramSoftTargetInstanceSource(InstanceSource):
             raise ValueError(
                 f"unigram_shortlist ({self._unigram_shortlist}) must be >= K ({self._K})"
             )
-        # Eager init: load the tables into RAM in the main process now so that
-        # DataLoader workers inherit them via fork (Linux PyTorch default) and
-        # share the numpy-array bytes CoW — paying the ~45 GB memory cost once
-        # instead of per-worker, and avoiding cold per-probe page faults
-        # against the underlying (possibly Weka-backed) file on the hot path.
+        # Eager init in the main (rank) process: this mmap's the tables AND
+        # triggers a sequential page-cache warm-up inside _NgramTable.__init__.
+        # DataLoader workers that spawn later on the same node will re-mmap
+        # the same files (via _get_lookup) and hit the already-warm OS page
+        # cache — so only the first process per node pays the Weka-read cost,
+        # and the hot-path random-access probes are DDR-speed for every
+        # process thereafter.
         from olmo_core.data.ngram_soft_target import NgramTableSoftTargetSource
 
-        self._lookup = NgramTableSoftTargetSource(
+        self._lookup: NgramTableSoftTargetSource | None = NgramTableSoftTargetSource(
             table_dir=self._table_dir,
             K=self._K,
             N_max=self._N_max,
@@ -111,6 +113,35 @@ class NgramSoftTargetInstanceSource(InstanceSource):
     @property
     def N_max(self) -> int:
         return self._N_max
+
+    def __getstate__(self):
+        """Exclude the live ``_lookup`` (which holds numpy memmap arrays over
+        the 45 GB table files) from pickle. Workers receiving this source via
+        DataLoader spawn will unpickle with ``_lookup=None`` and then
+        re-initialise it lazily on first ``__getitem__`` via
+        :meth:`_get_lookup`. That re-init mmaps the same files again; the
+        main process's eager-init step has already warmed the OS page cache
+        on this node, so the worker's sequential warm-scan is a cache-hit
+        walk rather than a weka pull.
+        """
+        state = self.__dict__.copy()
+        state["_lookup"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+    def _get_lookup(self):
+        if self._lookup is None:
+            from olmo_core.data.ngram_soft_target import NgramTableSoftTargetSource
+
+            self._lookup = NgramTableSoftTargetSource(
+                table_dir=self._table_dir,
+                K=self._K,
+                N_max=self._N_max,
+                unigram_shortlist=self._unigram_shortlist,
+            )
+        return self._lookup
 
     @ft.cached_property
     def fingerprint(self) -> str:
@@ -145,7 +176,7 @@ class NgramSoftTargetInstanceSource(InstanceSource):
             tuple(int(t) for t in input_ids[max(0, i + 1 - prefix_len) : i + 1])
             for i in range(S)
         ]
-        ids, probs = self._lookup.lookup_batch(contexts)
+        ids, probs = self._get_lookup().lookup_batch(contexts)
 
         out = dict(inst)
         out["soft_target_token_ids"] = ids  # (S, K) int32
