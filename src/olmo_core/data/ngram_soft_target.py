@@ -107,14 +107,26 @@ def _prefix_to_bytes(prefix_tokens: tuple[int, ...]) -> bytes:
     return struct.pack(f"<{len(prefix_tokens)}I", *prefix_tokens)
 
 
-def _hash_key(prefix_bytes: bytes) -> int:
+def _hash_and_digest(prefix_bytes: bytes) -> tuple[int, int]:
+    """One call → (hash_key_64, digest_32). Must stay bit-identical to
+    ``data_gen/arpa_to_table.py::_hash_and_digest`` (builder and reader
+    use the same function so probes locate the same slots as inserts)."""
     if _HAVE_XXHASH:
-        return int(xxhash.xxh3_64(prefix_bytes).intdigest())
-    return int.from_bytes(hashlib.sha256(prefix_bytes).digest()[:8], "little")
+        h128 = xxhash.xxh3_128(prefix_bytes).intdigest()
+        return (h128 >> 64) & 0xFFFFFFFFFFFFFFFF, h128 & 0xFFFFFFFF
+    digest_bytes = hashlib.sha256(prefix_bytes).digest()
+    return (
+        int.from_bytes(digest_bytes[:8], "little"),
+        int.from_bytes(digest_bytes[8:12], "little"),
+    )
+
+
+def _hash_key(prefix_bytes: bytes) -> int:
+    return _hash_and_digest(prefix_bytes)[0]
 
 
 def _digest(prefix_bytes: bytes) -> int:
-    return int.from_bytes(hashlib.sha256(prefix_bytes).digest()[8:12], "little")
+    return _hash_and_digest(prefix_bytes)[1]
 
 
 def _fixup_hash_key(h: int) -> int:
@@ -191,8 +203,9 @@ class _NgramTable:
         collision), advance one slot and keep probing.
         """
         pb = _prefix_to_bytes(prefix_tokens)
-        h = _fixup_hash_key(_hash_key(pb))
-        d = _digest(pb)
+        hk, dg = _hash_and_digest(pb)
+        h = _fixup_hash_key(hk)
+        d = dg
         slot = h & self.capacity_mask
         # Bounded probe: Robin Hood guarantees O(log n) worst case; cap at
         # capacity to be defensive against a malformed file.
