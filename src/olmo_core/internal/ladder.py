@@ -175,6 +175,14 @@ def parse_args(
             help="Do a dry-run of the launch.",
             default=False,
         )
+        parser.add_argument(
+            "--shared-memory",
+            type=str,
+            default=None,
+            help="Size of /dev/shm in the container, e.g. '64GiB'. Defaults to "
+            "BeakerLaunchConfig's 10GiB. Raise it if you're mirroring large "
+            "files into /dev/shm (e.g. the ngram-soft-target table cache).",
+        )
 
     sub_commands: dict[str, argparse.ArgumentParser] = {}
 
@@ -431,6 +439,8 @@ def configure_launcher(
     if args.preemptible is not None:
         launch_config.preemptible = args.preemptible
     launch_config.allow_dirty = args.allow_dirty
+    if getattr(args, "shared_memory", None) is not None:
+        launch_config.shared_memory = args.shared_memory
     return launch_config
 
 

@@ -147,57 +147,55 @@ def _fixup_hash_key(h: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-_SHM_CACHE_ROOT = Path(
-    os.environ.get("OLMO_CORE_NGRAM_TABLE_SHM_ROOT", "/dev/shm/ngram_table_cache")
-)
 # File-system prefixes we treat as "remote" and mirror to /dev/shm before use.
 # Weka mounts live at /weka/...; extend this list if we ever add other remotes.
 _REMOTE_PREFIXES = ("/weka/",)
 
+# tmpfs mirror root. /dev/shm is Linux's RAM-backed tmpfs. In Docker (which
+# beaker uses) its size defaults to 64 MB but is configurable via the
+# container's shared-memory setting — for beaker/olmo-core that's
+# ``BeakerLaunchConfig.shared_memory`` (controlled by the --shared-memory
+# CLI flag on the ladder launcher, added 2026-04-24). Make sure to request
+# at least (sum of table file sizes) + ~10% slack. E.g. for the pilot-v4
+# 1e-3 tables (~45 GB), --shared-memory 64GiB.
+_SHM_CACHE_ROOT = Path(
+    os.environ.get("OLMO_CORE_NGRAM_TABLE_SHM_ROOT", "/dev/shm/ngram_table_cache")
+)
+
 
 def _mirror_to_shm(path: str) -> str:
-    """Sequential-copy ``path`` into a tmpfs (``/dev/shm``) mirror once, return
-    the mirror path. Thread/process-safe via an ``fcntl.flock`` so that
-    concurrent ranks/workers cooperate — the first arrival does the copy,
-    everyone else blocks on the lock, finds the file already cached, and
-    returns the mirror path immediately.
+    """Sequential-copy ``path`` into the tmpfs mirror once, return the mirror
+    path. Thread/process-safe via an ``fcntl.flock`` so that concurrent
+    ranks/workers cooperate — the first arrival does the copy, everyone else
+    blocks on the lock, finds the file already cached, and returns the
+    mirror path immediately.
 
-    The point: ``/dev/shm`` is tmpfs (RAM-backed). Once the mirror exists,
-    all processes on this node that later ``np.memmap`` the mirror path
-    hit pages that already live in RAM via the OS page cache — random-access
-    probes are DDR-speed, with zero further weka I/O.
+    Fails loudly if /dev/shm can't fit the mirror — do not silently fall back
+    to slower filesystems. For beaker runs, set the shared-memory budget via
+    the ladder launcher's ``--shared-memory`` flag.
 
     If ``path`` isn't on a remote filesystem (Weka), returns it unchanged.
-    If the tmpfs copy already exists with the right size, returns it without
-    recopying. The cache root is configurable via the
-    ``OLMO_CORE_NGRAM_TABLE_SHM_ROOT`` env var (default ``/dev/shm/ngram_table_cache``).
     """
     if not any(path.startswith(p) for p in _REMOTE_PREFIXES):
         return path
 
     src_size = os.path.getsize(path)
-    # Derive a stable cache filename from the source path so that two
-    # different source files with the same basename can't collide.
     path_hash = _hashlib_for_paths.sha1(path.encode("utf-8")).hexdigest()[:12]
     cache_dir = _SHM_CACHE_ROOT / path_hash
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / Path(path).name
 
-    # Fast path: cache already exists and is the right size.
+    # Fast path: cache already exists.
     try:
         if cache_path.is_file() and cache_path.stat().st_size == src_size:
             return str(cache_path)
     except OSError:
         pass
 
-    # Slow path: take an exclusive lock and copy. Other processes that arrive
-    # concurrently will block here and find the cache populated when they
-    # acquire the lock in turn.
     lock_path = str(cache_path) + ".lock"
     with open(lock_path, "w") as lock_f:
         fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
-        # Re-check under the lock — another process may have populated the
-        # cache while we were waiting.
+        # Re-check under the lock.
         if cache_path.is_file() and cache_path.stat().st_size == src_size:
             return str(cache_path)
         tmp_path = Path(str(cache_path) + ".partial")
@@ -210,14 +208,8 @@ def _mirror_to_shm(path: str) -> str:
                 file=sys.stderr,
                 flush=True,
             )
-            # Sequential chunked copy. shutil.copyfile uses a large block size
-            # under the hood (64 KB default, bumped to 16 MB on modern Python
-            # for performance); we use copyfileobj with an explicit 32 MB
-            # buffer to keep weka-side reads large and contiguous.
             with open(path, "rb") as src, open(tmp_path, "wb") as dst:
                 shutil.copyfileobj(src, dst, length=32 * 1024 * 1024)
-            # Rename atomically into place — ensures partially-copied files
-            # never expose themselves to concurrent readers.
             tmp_path.replace(cache_path)
             elapsed = time.time() - t0
             print(
@@ -227,7 +219,6 @@ def _mirror_to_shm(path: str) -> str:
                 flush=True,
             )
         except BaseException:
-            # Clean up the partial file so a retry can start fresh.
             try:
                 tmp_path.unlink()
             except FileNotFoundError:
