@@ -82,10 +82,19 @@ class NgramSoftTargetInstanceSource(InstanceSource):
             raise ValueError(
                 f"unigram_shortlist ({self._unigram_shortlist}) must be >= K ({self._K})"
             )
-        # Lazy per-process init: we don't open the mmap'd tables in the
-        # main process, so each DataLoader worker ends up with its own
-        # _NgramTable instances (OS page cache dedupes the underlying I/O).
-        self._lookup = None
+        # Eager init: load the tables into RAM in the main process now so that
+        # DataLoader workers inherit them via fork (Linux PyTorch default) and
+        # share the numpy-array bytes CoW — paying the ~45 GB memory cost once
+        # instead of per-worker, and avoiding cold per-probe page faults
+        # against the underlying (possibly Weka-backed) file on the hot path.
+        from olmo_core.data.ngram_soft_target import NgramTableSoftTargetSource
+
+        self._lookup = NgramTableSoftTargetSource(
+            table_dir=self._table_dir,
+            K=self._K,
+            N_max=self._N_max,
+            unigram_shortlist=self._unigram_shortlist,
+        )
 
     @property
     def source(self) -> InstanceSource:
@@ -102,21 +111,6 @@ class NgramSoftTargetInstanceSource(InstanceSource):
     @property
     def N_max(self) -> int:
         return self._N_max
-
-    def _get_lookup(self):
-        if self._lookup is None:
-            # Imported lazily so instantiating this class in a process that
-            # never calls __getitem__ (e.g. the main coordinator rank) does
-            # not require numba/xxhash to be importable there.
-            from olmo_core.data.ngram_soft_target import NgramTableSoftTargetSource
-
-            self._lookup = NgramTableSoftTargetSource(
-                table_dir=self._table_dir,
-                K=self._K,
-                N_max=self._N_max,
-                unigram_shortlist=self._unigram_shortlist,
-            )
-        return self._lookup
 
     @ft.cached_property
     def fingerprint(self) -> str:
@@ -151,7 +145,7 @@ class NgramSoftTargetInstanceSource(InstanceSource):
             tuple(int(t) for t in input_ids[max(0, i + 1 - prefix_len) : i + 1])
             for i in range(S)
         ]
-        ids, probs = self._get_lookup().lookup_batch(contexts)
+        ids, probs = self._lookup.lookup_batch(contexts)
 
         out = dict(inst)
         out["soft_target_token_ids"] = ids  # (S, K) int32
