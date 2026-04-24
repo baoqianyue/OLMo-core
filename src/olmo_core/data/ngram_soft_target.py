@@ -118,7 +118,11 @@ def _digest(prefix_bytes: bytes) -> int:
 
 
 def _fixup_hash_key(h: int) -> int:
-    return h | 1  # reserve 0 as "empty slot" sentinel
+    # Only mutates h when it is literally 0 (probability 2^-64), so the
+    # hash distribution is preserved. Must stay bit-identical to
+    # ``data_gen/arpa_to_table.py`` because insert and probe use it
+    # symmetrically.
+    return h if h != 0 else 1
 
 
 # ---------------------------------------------------------------------------
