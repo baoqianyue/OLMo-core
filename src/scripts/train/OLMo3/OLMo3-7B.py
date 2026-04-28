@@ -38,12 +38,19 @@ def build_model_config(common: CommonComponents) -> TransformerConfig:
 
 
 def build_train_module_config(common: CommonComponents) -> TransformerTrainModuleConfig:
+    # rank_microbatch_size 的单位是 token，不是“样本数”。这里默认设成
+    # max_sequence_length，表示每张卡每个 micro-batch 处理 1 条 8K 序列。
+    # B200 显存和吞吐更强，脚本在检测到所有 launch cluster 都是 B200 时把它翻倍，
+    # 即每张卡每个 micro-batch 处理 2 条 8K 序列，减少梯度累积次数、提高吞吐。
     rank_microbatch_size = common.max_sequence_length
     if common.launch is not None:
         gpus = {CLUSTER_TO_GPU_TYPE.get(c, "unknown") for c in common.launch.clusters}
         if all("B200" in g for g in gpus):
             rank_microbatch_size *= 2
 
+    # TransformerTrainModuleConfig 描述“一步训练怎么执行”：如何切 micro-batch、
+    # 用什么优化器和 scheduler、如何做 HSDP 包裹、是否 torch.compile/FP8、
+    # 以及 loss 正则和梯度裁剪。外层 Trainer 只负责循环和 checkpoint 调度。
     return TransformerTrainModuleConfig(
         rank_microbatch_size=rank_microbatch_size,
         max_sequence_length=common.max_sequence_length,

@@ -108,6 +108,98 @@ max_duration=Duration.epochs(1)
 - `rank_microbatch_size` 的单位也是 token，用来控制单卡一次 forward/backward 的本地 token 数。
 - 7B 和 32B 都用 `SkipStepAdamWConfig`，当 loss 或 grad norm 异常偏离滚动统计时可以跳过不稳定 step。
 
+#### 3.1.1 `OLMo3-7B.py` 中 `build_train_module_config()` 逐参数解释
+
+这一段代码是 7B 预训练脚本里最核心的“训练 step 配方”。它不定义模型结构，也不定义数据来源；它定义的是：模型拿到一个 batch 后，如何切 micro-batch、如何前向/反向、如何并行包裹、如何做优化器更新、如何稳定 loss。
+
+```python
+rank_microbatch_size = common.max_sequence_length
+```
+
+**`rank_microbatch_size` 的单位是 token。`common.max_sequence_length` 来自脚本底部传给 `build_config()` 的 `SEQUENCE_LENGTH = 8 * 1024`，所以默认值是 8192 tokens。因为每条训练样本长度也是 8192，这等价于“每个 rank 每个 micro-batch 处理 1 条序列”**。
+
+举例：假设 `global_batch_size = 4 * 1024 * 1024`，即约 419 万 tokens，而序列长度是 8192，那么一个全局 batch 大约包含 `4194304 / 8192 = 512` 条 8K 序列。这 512 条序列会先按 data parallel rank 分给不同 GPU；如果某个 rank 分到多条序列，再由 `rank_microbatch_size` 决定一次 forward/backward 放几条进去。micro-batch 只影响显存和梯度累积，不改变数学意义上的全局 batch size。
+
+```python
+if common.launch is not None:
+    gpus = {CLUSTER_TO_GPU_TYPE.get(c, "unknown") for c in common.launch.clusters}
+    if all("B200" in g for g in gpus):
+        rank_microbatch_size *= 2
+```
+
+这段是硬件条件分支：如果通过 Beaker launch 启动，并且所有 cluster 都映射到 B200 GPU，就把 rank micro-batch 从 8192 tokens 提到 16384 tokens。含义是每个 rank 每次处理 2 条 8K 序列。B200 显存/吞吐更强，能承受更大的本地 micro-batch；好处是一次全局 batch 需要的梯度累积轮数更少，通信和调度开销也更低。
+
+```python
+TransformerTrainModuleConfig(
+    rank_microbatch_size=rank_microbatch_size,
+    max_sequence_length=common.max_sequence_length,
+    ...
+)
+```
+
+`TransformerTrainModuleConfig` 会在 `ExperimentConfig` 进入训练后 build 成 `TransformerTrainModule`。它对应 `src/olmo_core/train/train_module/transformer/train_module.py`，负责真正的一次训练 step：切 micro-batch、调用模型 forward、backward、梯度同步、梯度裁剪、scheduler 写入 LR、optimizer step。外层 `Trainer` 则负责循环、checkpoint、callback 和评测调度。
+
+```python
+optim=SkipStepAdamWConfig(
+    lr=3e-4,
+    weight_decay=0.1,
+    betas=(0.9, 0.95),
+    group_overrides=[
+        OptimGroupOverride(params=["embeddings.weight"], opts=dict(weight_decay=0.0))
+    ],
+)
+```
+
+这里使用的是 OLMo3 预训练的 AdamW 变体：
+
+- `lr=3e-4`：7B 预训练 peak learning rate。它和前面的表格对应，32B 脚本里会用更高的 `6e-4`。
+- `weight_decay=0.1`：对大多数权重施加 AdamW decoupled weight decay，抑制权重无约束变大。
+- `betas=(0.9, 0.95)`：Adam 动量参数。`0.9` 是一阶动量平滑，`0.95` 是二阶矩平滑；LLM 预训练常用比 Adam 默认 `0.999` 更低的 beta2，让二阶统计更快跟上训练早期和数据分布变化。
+- `group_overrides`：把 `embeddings.weight` 单独拉到一个 param group，并设置 `weight_decay=0.0`。这对应报告里的“embedding 不做 weight decay”。直觉上，embedding 矩阵直接承载 token 表示，过强的 decay 可能不必要地压缩词向量尺度。
+
+`SkipStepAdamWConfig` 额外维护 loss/grad norm 的滚动统计。如果某一步异常偏离统计范围，可以把更新因子变成 0 来跳过这次不稳定 optimizer step。脚本底部也写了 `include_instance_filter=False  # We use SkipStepOptimizer for this problem.`，意思是这里更依赖 optimizer 层面的异常 step 保护，而不是在数据入口先过滤重复/异常 instance。
+
+```python
+compile_model=True
+```
+
+启用 `torch.compile`。模型会在并行改造之后被编译，以减少 Python 调度开销并让 PyTorch 编译器做 kernel/图层面的优化。对 7B/32B 这类长时间训练，编译的启动成本可以被后续大量 step 摊薄。
+
+```python
+dp_config=TransformerDataParallelConfig(
+    name=DataParallelType.hsdp,
+    param_dtype=DType.bfloat16,
+    reduce_dtype=DType.float32,
+    wrapping_strategy=TransformerDataParallelWrappingStrategy.blocks,
+)
+```
+
+这里使用 HSDP，也就是 hybrid sharded data parallel。可以把它理解成 FSDP 和数据并行复制的组合：参数、梯度、optimizer state 在 shard 组内切分，同时在 replica 维度上复制模型副本。`param_dtype=bfloat16` 表示模型参数通信/存储主要用 bf16，省显存；`reduce_dtype=float32` 表示梯度归约用 fp32，提高数值稳定性；`wrapping_strategy=blocks` 表示主要按 Transformer blocks 粒度做 FSDP/HSDP 包裹，而不是把 block 内部 attention/MLP 再切得更细。
+
+```python
+float8_config=Float8Config(enabled=False)
+```
+
+显式关闭 FP8。框架支持把部分 Linear 转成 torchao Float8/MX 格式，但这个 7B 预训练脚本保持 bf16 主线，避免引入额外量化动态 scale、硬件兼容性和数值验证成本。长上下文脚本里会看到更积极的 FP8 使用。
+
+```python
+z_loss_multiplier=1e-5
+```
+
+z-loss 是作用在 logits log-sum-exp 上的稳定化正则，防止 logits 尺度不断膨胀。训练时 `LMHead` 会返回 CE loss 和 z-loss，`TransformerTrainModule` 用这个 multiplier 把 z-loss 加进总 loss。报告 Table 33 中的 z-loss weight 也对应 `1e-5`。
+
+```python
+max_grad_norm=1.0
+```
+
+梯度裁剪阈值。`optim_step()` 前会计算梯度范数，如果超过 1.0 就按比例缩放。它和 `SkipStepAdamWConfig` 是两层保护：梯度裁剪处理“偏大但仍可更新”的梯度，SkipStep 处理“明显异常、不想更新”的 step。
+
+```python
+scheduler=CosWithWarmup(warmup_steps=2000)
+```
+
+预训练使用 warmup + cosine decay。前 2000 个 optimizer step 从较低 LR 线性升到 `lr=3e-4`，之后按 cosine 曲线下降。`CosWithWarmup` 的默认 `alpha_f=0.1`，所以如果没有额外覆盖，末端 LR 会降到初始 LR 的 10%。注意这里的 step 是 optimizer step，不是 micro-batch；如果全局 batch 被切成多个 micro-batch，只有累积完成并执行一次 optimizer step 后，scheduler 才前进一次。
+
 ### 3.2 Midtraining
 
 7B 入口：`src/scripts/train/OLMo3/OLMo3-7B-midtraining.py`
@@ -762,6 +854,138 @@ SkipStepAdamWConfig(
 - 当前 step 如果超过均值若干 sigma，则 `step_factor=0`。
 - AdamW update 中所有更新乘以 `step_factor`。
 - 这样跳过异常 step 时尽量避免 host-device sync。
+
+### 11.1 `SkipStepAdamW` 的原理和实现
+
+`SkipStepAdamW` 分成两层理解：
+
+第一层是父类 `SkipStepOptimizer`，路径是 `src/olmo_core/optim/skip_step_optimizer.py`。它不关心 AdamW 的公式，只负责判断“这一步要不要跳”。训练循环在 `TransformerTrainModule.optim_step()` 里会先把当前 batch 的 loss 和 grad norm 写到 optimizer：
+
+```python
+optim.latest_loss = ...
+optim.latest_grad_norm = ...
+optim.step()
+```
+
+父类内部维护两个滚动窗口：
+
+```python
+self._losses
+self._grad_norms
+```
+
+窗口长度由 `rolling_interval_length` 控制，默认是 128。`get_step_factor()` 的逻辑是：
+
+```text
+如果历史步数还不够：
+  step_factor = 1.0
+否则：
+  loss_mean/loss_std = 过去窗口 loss 的均值和标准差
+  grad_mean/grad_std = 过去窗口 grad norm 的均值和标准差
+
+  如果当前 loss 没有超过 loss_mean + sigma_factor * loss_std
+  且当前 grad norm 没有超过 grad_mean + sigma_factor * grad_std:
+      step_factor = 1.0
+  否则:
+      step_factor = 0.0
+```
+
+默认 `sigma_factor=6`，意思是只跳过非常极端的尖峰。`rolling_interval_length=128` 时，代码会等历史至少达到 `max(2, 128 // 2) = 64` 条以后才开始判断；前 64 步直接更新，避免统计窗口太小导致误判。
+
+举个简化例子：假设过去一段 loss 均值是 2.0，标准差是 0.1，`sigma_factor=6`，阈值就是 `2.0 + 6 * 0.1 = 2.6`。如果当前 loss 是 2.3，正常更新；如果当前 loss 突然变成 20.0，就会得到 `step_factor=0`，这一步不会更新参数。
+
+第二层是 `SkipStepAdamW` 本身，路径是 `src/olmo_core/optim/adamw.py`。它把 `step_factor` 乘进 AdamW 的每个关键位置：
+
+```python
+p.mul_(1 - step_factor * (lr * weight_decay))
+exp_avg.lerp_(grad, step_factor * (1 - beta1))
+exp_avg_sq.mul_(1 - step_factor * (1 - beta2))
+exp_avg_sq.add_(step_factor * grad * grad, alpha=1 - beta2)
+update.mul_(step_factor)
+step.add_(step_factor)
+```
+
+当 `step_factor=1` 时，这就是标准 AdamW：做 weight decay，更新一阶/二阶动量，计算 bias correction，更新参数，并把 Adam step 加 1。
+
+当 `step_factor=0` 时，所有关键动作都变成 no-op：
+
+- weight decay 不发生。
+- `exp_avg` 和 `exp_avg_sq` 不被异常梯度污染。
+- 参数更新量是 0。
+- Adam 的 `step` 不增加，bias correction 不会被一个“没有真实更新”的 step 推进。
+
+这和“在 Python 里写 `if should_skip: return`”很像，但实现上更适合大规模 GPU 训练。`step_factor` 是一个在设备上的 tensor，直接参与 CUDA kernel 计算，不需要把 GPU 上的判断结果同步回 CPU。注释里提到的 host-device sync 就是这个意思：如果每一步都把布尔值从 GPU 拿回 Python 决策，会引入同步等待，影响吞吐。
+
+`foreach=True` 时走 `_step_foreach()`，它把许多参数 tensor 收集成列表，用 `torch._foreach_*` multi-tensor kernel 批量更新；`foreach=False` 时走 `_step()`，逐参数调用 `adamw_step()`。两条路径的数学语义相同，默认配置里 `foreach=True` 是为了更好的性能。
+
+`step_increment_bugfix=True` 是一个兼容开关。注释说明如果设成 `False`，旧行为不会正确增加 Adam step，等效学习率会偏高且 bias correction 不正确；新训练应保持默认 `True`。
+
+### 11.2 `@OptimConfig.register("skip_step_adamw")` 和 `@dataclass`
+
+这两行是 Python 装饰器。装饰器的形式是 `@something`，会在类定义完成后接收这个类，并返回一个类。这里它们叠在一起：
+
+```python
+@OptimConfig.register("skip_step_adamw")
+@dataclass
+class SkipStepAdamWConfig(OptimConfig[SkipStepAdamW]):
+    ...
+```
+
+执行顺序是从下往上：
+
+1. `@dataclass` 先处理 `SkipStepAdamWConfig`。
+2. `@OptimConfig.register("skip_step_adamw")` 再处理 dataclass 化后的类。
+
+`@dataclass` 来自 Python 标准库 `dataclasses`。它会读取类里的字段声明：
+
+```python
+lr: float = 1e-3
+betas: Tuple[float, float] = (0.9, 0.999)
+weight_decay: float = 1e-2
+```
+
+然后自动生成初始化函数和一些样板方法。没有它，你需要手写类似下面的代码：
+
+```python
+def __init__(self, lr=1e-3, betas=(0.9, 0.999), weight_decay=1e-2, ...):
+    self.lr = lr
+    self.betas = betas
+    self.weight_decay = weight_decay
+```
+
+有了 `@dataclass`，训练脚本就可以自然地写：
+
+```python
+SkipStepAdamWConfig(lr=3e-4, weight_decay=0.1, betas=(0.9, 0.95))
+```
+
+`@OptimConfig.register("skip_step_adamw")` 是 OLMo-core 的可注册配置机制。`OptimConfig` 继承了 `Registrable`，所以每个具体 optimizer config 都可以用一个字符串名字注册。注册后，配置序列化时能带上：
+
+```yaml
+type: skip_step_adamw
+lr: 0.0003
+weight_decay: 0.1
+```
+
+反序列化或从配置文件加载时，框架看到 `type: skip_step_adamw`，就能从注册表找到 `SkipStepAdamWConfig`，再根据其 dataclass 字段构造对象。这个设计让配置文件不必写完整 Python import 路径，也让同一个 `optim` 字段可以承载不同优化器，比如 `adamw`、`skip_step_adamw`、`lion`。
+
+最后，`SkipStepAdamWConfig.optimizer()` 返回真正的优化器类：
+
+```python
+@classmethod
+def optimizer(cls) -> Type[SkipStepAdamW]:
+    return SkipStepAdamW
+```
+
+所以完整链路是：
+
+```text
+配置文件/脚本里的 SkipStepAdamWConfig
+  -> OptimConfig.build(model)
+  -> build_groups(model)，处理 group_overrides
+  -> self.optimizer() 得到 SkipStepAdamW
+  -> SkipStepAdamW(param_groups, lr=..., betas=..., ...)
+```
 
 scheduler：
 
