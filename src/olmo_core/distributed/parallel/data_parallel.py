@@ -25,6 +25,11 @@ class DPMeshDimName(StrEnum):
 
 
 class DataParallelType(StrEnum):
+    # 中文导读：这里枚举的是“数据并行模型包装方式”。
+    #   ddp:  每个 DP rank 保留完整参数，反向后 all-reduce 梯度。
+    #   fsdp: 参数/梯度/optimizer state 在 DP rank 间分片，计算时按模块 all-gather。
+    #   hsdp: Hybrid FSDP，通常把 DP 维度拆成 replicate 和 shard 两维。
+    # 具体分支在 train/train_module/transformer/common.py::parallelize_model()。
     fsdp = "fsdp"
     hsdp = "hsdp"
     ddp = "ddp"
@@ -32,6 +37,12 @@ class DataParallelType(StrEnum):
 
 @dataclass
 class DataParallelConfig(Config):
+    # 中文导读：这是所有 DP 类配置的基类。Transformer 专用配置
+    # TransformerDataParallelConfig 会继承它并额外增加 wrapping_strategy。
+    #
+    # name 决定走 DDP、FSDP 还是 HSDP；param_dtype/reduce_dtype 分别控制
+    # 参数 materialize dtype 和梯度通信 dtype；num_replicas/shard_degree
+    # 只在 HSDP 拆分 replicate/shard 维度时使用。
     name: DataParallelType
     param_dtype: Optional[DType] = None
     reduce_dtype: DType = DType.float32
@@ -45,6 +56,14 @@ class DataParallelConfig(Config):
         :param dp_world_size: The data parallel world size.
         :return: A tuple of (num_replicas, shard_degree)
         """
+        # 中文导读：HSDP 会把数据并行维度拆成：
+        #   num_replicas: 有几份 FSDP 分片组副本，通常跨节点；
+        #   shard_degree: 每个副本内部用几张卡做 FSDP 参数分片，通常节点内。
+        #
+        # 例子：dp_world_size=16，2 个节点，每节点 8 卡，默认 get_num_nodes()=2：
+        #   num_replicas = 2
+        #   shard_degree = 16 // 2 = 8
+        # 含义是节点内 8 卡做 shard，两个节点之间做副本级同步。
         if self.num_replicas is None and self.shard_degree is None:
             return get_num_nodes(), dp_world_size // get_num_nodes()
         elif self.num_replicas is not None and self.shard_degree is not None:

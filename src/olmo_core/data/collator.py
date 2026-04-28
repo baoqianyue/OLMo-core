@@ -45,6 +45,9 @@ class DataCollator:
         """
         Create a batch from a sequence of instances.
         """
+        # 中文导读：DataLoader 产生的是若干 token 序列或 instance dict，
+        # Collator 负责把它们 pad 成同一长度并堆叠成 batch。这里不做模型计算，
+        # 但会决定 input_ids、attention_mask、label_mask、doc_lens 等字段的形状。
         assert items
         max_len = max((len(x["input_ids"] if isinstance(x, dict) else x) for x in items))
         all_input_ids = []
@@ -72,6 +75,8 @@ class DataCollator:
             )
 
             # Pad input IDs.
+            # 中文导读：input_ids 最终形状是 (batch, max_len)，dtype 固定为 long。
+            # pad_token_id 只影响输入；labels 是否忽略 padding 通常由 label_mask/get_labels 处理。
             all_input_ids.append(
                 F.pad(
                     input_ids.to(dtype=torch.long),
@@ -134,6 +139,8 @@ class DataCollator:
                 all_instance_mask.append(torch.tensor(instance_mask))
 
             # Document lengths.
+            # 中文导读：doc_lens 保存一个 packed sample 内部各文档长度。
+            # Transformer.forward() 会把它转成 cu_doc_lens，用于文档边界 mask 或 context parallel。
             doc_lens = x.get("doc_lens") if isinstance(x, dict) else None
             if doc_lens is not None:
                 doc_pad_shape = (0, max_docs - len(doc_lens))

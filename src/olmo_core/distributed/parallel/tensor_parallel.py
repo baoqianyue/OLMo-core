@@ -20,11 +20,19 @@ class TensorParallelConfig(Config):
     Configuration class for tensor parallelism (TP).
     """
 
+    # 中文导读：TP 的 degree 表示“同一个模型层的计算切成几份”。
+    # 例如 degree=2 时，一个 DP/CP 分片内部会有 2 个 rank 协作计算
+    # attention heads、MLP hidden、LM head 等层内大张量。
+    # build_world_mesh() 会把这个 degree 变成名为 "tp" 的 mesh 维度；
+    # common.py::parallelize_model() 会调用 get_tp_mesh() 再传给 Transformer.apply_tp()。
     degree: int
     """
     The TP degree.
     """
 
+    # 中文导读：实验性的 async TP。开启后会启用 torch inductor 的
+    # micro-pipeline TP 相关配置，并为 TP process group 打开 symmetric memory。
+    # 它是性能优化，不改变“tp.degree 如何分组”的基本语义。
     enable_async: bool = False
     """
     Enable experimental async tensor parallelism.
@@ -49,6 +57,10 @@ class SequenceParallel(_SequenceParallel):
         output_layouts: Optional[Placement] = None,
     ):
         super().__init__(sequence_dim=sequence_dim, use_local_output=use_local_output)
+        # 中文导读：SequenceParallel 是 TP 里的常见配套布局。
+        # 它把张量沿 sequence 维 shard，例如 hidden [B, S, D] 在 degree=2 时
+        # 变成每个 rank 本地大致 [B, S/2, D]。这样 norm/dropout 等按 token
+        # 独立的操作可以在本地 sequence shard 上完成。
         self.output_layouts = (output_layouts or Shard(sequence_dim),)
 
     @staticmethod

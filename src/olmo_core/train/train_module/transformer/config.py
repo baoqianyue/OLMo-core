@@ -159,6 +159,18 @@ class TransformerDataParallelConfig(DataParallelConfig):
     Transformer-specific data parallel config.
     """
 
+    # 中文导读：这是 Transformer 训练里 DP/DDP/FSDP/HSDP 的用户侧配置入口。
+    # 真正执行位置在：
+    #   train/train_module/transformer/common.py::parallelize_model()
+    #     dp_config.name == fsdp/hsdp -> Transformer.apply_fsdp()
+    #     dp_config.name == ddp       -> Transformer.apply_ddp()
+    #
+    # 例子：
+    #   TransformerDataParallelConfig(
+    #       name=DataParallelType.fsdp,
+    #       wrapping_strategy=TransformerDataParallelWrappingStrategy.blocks,
+    #   )
+    # 表示用 FSDP 做数据并行，并主要按 transformer block 粒度包裹。
     wrapping_strategy: TransformerDataParallelWrappingStrategy = (
         TransformerDataParallelWrappingStrategy.full
     )
@@ -166,6 +178,10 @@ class TransformerDataParallelConfig(DataParallelConfig):
     The wrapping strategy.
     """
 
+    # 中文导读：FSDP forward 预取后续模块参数的数量。
+    # prefetch_factor=0 表示不额外预取；prefetch_factor=2 表示当前 block
+    # 运行时提示 FSDP 提前 all-gather 后面两个 block。它可能隐藏通信延迟，
+    # 但也会提高同时驻留的参数显存。
     prefetch_factor: int = 0
 
 
@@ -174,6 +190,15 @@ class TransformerTensorParallelConfig(TensorParallelConfig):
     """
     Transformer-specific tensor parallel config.
     """
+    # 中文导读：这是 TP 的 Transformer 侧配置入口。
+    # degree 来自父类 TensorParallelConfig，表示把层内计算切成几份。
+    # 真正执行位置在：
+    #   common.py::parallelize_model()
+    #     -> get_tp_mesh(world_mesh)
+    #     -> Transformer.apply_tp(tp_mesh)
+    #
+    # 例子：tp.degree=2 时，同一个 DP/CP 分片内会有 2 个 rank 共同完成
+    # attention heads、MLP hidden、LM head 等层内大矩阵计算。
 
 
 @dataclass
@@ -182,10 +207,23 @@ class TransformerContextParallelConfig(ContextParallelConfig):
     Transformer-specific context parallel config.
     """
 
+    # 中文导读：这是 CP 的 Transformer 侧配置入口。degree 来自父类
+    # ContextParallelConfig，表示一条长序列沿 context/sequence 维切成几份。
+    # 这里额外选择具体 attention 通信风格：ring 或 ulysses。
+    #
+    # 真正执行位置在：
+    #   common.py::parallelize_model()
+    #     -> get_cp_mesh(world_mesh)
+    #     -> Transformer.apply_cp(cp_mesh, ring=..., uly=...)
+    #
+    # 例子：seq_len=8192、degree=4 时，每个 CP rank 先持有约 2048 token。
+    # 这些 rank 处理同一批样本的不同序列片段，不是不同样本。
     ring: RingContextParallelStyle | None = None
     uly: UlyssesContextParallelStyle | None = None
 
     def __post_init__(self):
+        # 中文导读：当前实现要求 ring 和 ulysses 二选一。它们都是为了解决
+        # “attention 需要跨 sequence 分片看见其它 token”的通信问题，只是通信布局不同。
         if self.ring is not None and self.uly is not None:
             raise NotImplementedError(
                 "Only one of ring or ulysses can be specified. While not technically "
@@ -227,6 +265,13 @@ class TransformerExpertParallelConfig(ExpertParallelConfig):
     """
     Transformer-specific expert parallel config.
     """
+    # 中文导读：这是 EP 的 Transformer 侧配置入口，只对 MoETransformer 有效。
+    # degree 来自父类 ExpertParallelConfig，表示 expert 维度切到几个 rank。
+    # 真正执行位置在：
+    #   common.py::parallelize_model()
+    #     -> get_ep_mesh(world_mesh)
+    #     -> MoETransformer.apply_ep(ep_mesh)
+    # dense Transformer 没有 experts，因此配置 EP 会报错。
 
 
 @beta_feature
@@ -241,6 +286,15 @@ class TransformerActivationCheckpointingConfig(Config):
     The activation checkpointing mode.
     """
 
+    # 中文导读：这是 activation checkpointing 的用户侧配置入口。
+    # 真正执行位置在：
+    #   common.py::parallelize_model()
+    #     -> Transformer.apply_activation_checkpointing(...)
+    #
+    # full:            包每个 transformer block，最省显存，重算最多。
+    # selected_blocks: 例如 block_interval=2，只包第 0/2/4... 层。
+    # selected_modules:按模块名/glob 包一部分模块。
+    # budget:          交给 torch.compile 预算机制，要求 compile_model=True。
     block_interval: Optional[int] = None
     """
     Required when :data:`mode` is "selected_blocks". Determines which blocks are wrapped.

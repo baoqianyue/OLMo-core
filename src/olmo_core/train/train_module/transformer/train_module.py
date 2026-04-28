@@ -125,6 +125,12 @@ class TransformerTrainModule(TrainModule):
         super().__init__()
 
         # Validate some options.
+        # 中文导读：rank_microbatch_size 的单位是“token”，不是样本数。
+        # 它必须能被 max_sequence_length 整除，因为后面会用：
+        #   micro_batch_num_instances = rank_microbatch_size // seq_len
+        # 来决定一个 micro-batch 放几条序列。
+        # 例如 max_sequence_length=2048 时，rank_microbatch_size=8192 表示每个 rank
+        # 一次最多处理 4 条 2048 长度的序列；如果写成 9000，就无法切成整数条序列。
         if rank_microbatch_size % max_sequence_length != 0:
             raise OLMoConfigurationError(
                 f"'rank_microbatch_size' ({rank_microbatch_size:,d} tokens) must be divisible by "
@@ -132,6 +138,16 @@ class TransformerTrainModule(TrainModule):
             )
 
         # Build world mesh.
+        # 中文导读：world_mesh 是 PyTorch DeviceMesh，用来把所有进程/rank
+        # 组织成带名字的多维网格。后续 DP/TP/CP/EP 都不是直接拿 global rank
+        # 自己算分组，而是从这个 mesh 里取对应维度的 sub-mesh。
+        #
+        # 例子：8 卡，dp=fsdp，cp.degree=2，tp.degree=2 时，剩余 DP 维度是：
+        #   dp_world_size = 8 / cp_degree / tp_degree = 2
+        # world mesh 形状大致是：
+        #   (dp=2, cp=2, tp=2)
+        # 含义是 2 组数据并行副本；每个副本内部又按序列维度切成 2 份 CP，
+        # 再按 hidden/head/MLP 等张量维度切成 2 份 TP。
         self.device = device or get_default_device()
         self.world_mesh: Optional[DeviceMesh] = None
         if is_distributed():
@@ -149,6 +165,9 @@ class TransformerTrainModule(TrainModule):
                 "Training parallelism configs are only valid for distributed training"
             )
 
+        # 中文导读：activation checkpointing 的 budget 模式交给 torch.compile 的
+        # min-cut/recompute 机制做取舍，所以必须先启用 compile_model。普通 full /
+        # selected_blocks / selected_modules 模式不依赖 compile。
         if (
             ac_config is not None
             and ac_config.mode == TransformerActivationCheckpointingMode.budget
@@ -159,6 +178,11 @@ class TransformerTrainModule(TrainModule):
             )
 
         # Parallelize model.
+        # 中文导读：真正改造模型结构的逻辑集中在 parallelize_model()：
+        #   1) 根据 FP8/CP/TP/EP/AC/compile/DP 配置给模型模块打补丁或包 wrapper；
+        #   2) 再调用 init_weights() 把 meta-device 上的参数 materialize 到真实设备。
+        # 这也是官方脚本里 model.build(init_device="meta") 能节省初始化显存峰值的原因：
+        # 模型先只是“形状”，等并行策略确定后再按 shard/replica 初始化真实权重。
         self.model = parallelize_model(
             model,
             world_mesh=self.world_mesh,
@@ -343,14 +367,34 @@ class TransformerTrainModule(TrainModule):
             gc_cuda()
 
     def train_batch(self, batch: Dict[str, Any], dry_run: bool = False):
+        # 中文导读：这是 Transformer 训练 step 的核心。Trainer 只负责调度，
+        # 这里才负责构造 labels、切 micro-batch、forward、loss、backward 和训练指标。
+        # 一个典型输入例子（单个 rank 视角）：
+        #   batch["input_ids"].shape == (B, S) = (8, 1024)
+        # 表示这个 rank 当前拿到 8 条序列、每条长度 1024 token。
+        # 如果还带有打包信息，可能额外有：
+        #   batch["doc_lens"].shape == (8, max_docs)
+        #   batch["instance_mask"].shape == (8,)
+        # 其中 B 是“当前 rank 的 batch 大小”，不是全局所有 rank 的总和。
         # Set model to train mode if it isn't already.
         self._set_model_mode("train")
 
         # Generate labels.
+        # 中文导读：自回归 LM 的 labels 通常由 input_ids 右移生成。
+        # label_ignore_index=-100 的位置不会参与 CE loss。
+        # 例如 input_ids[0] = [11, 12, 13, 14]
+        # 则常见 labels[0]     = [12, 13, 14, -100]
+        # 也就是说模型在位置 t 预测位置 t+1 的 token。
         if "labels" not in batch:
             batch["labels"] = get_labels(batch, label_ignore_index=self.label_ignore_index)
 
         # Calculate how many tokens will be used in the loss.
+        # 中文导读：loss 使用整个 batch 的有效 token 数归一化，而不是单个
+        # micro-batch 的 token 数，避免梯度累积时不同 micro-batch 大小造成 loss 偏置。
+        # 若 batch["labels"].shape = (8, 1024)，那么：
+        #   batch_num_tokens = 8192
+        # 若每条序列最后一个位置都被置为 -100，则：
+        #   batch_num_tokens_for_loss = 8 * 1023 = 8184
         batch_num_tokens = batch["labels"].numel()
         batch_num_tokens_per_instance = batch["labels"].shape[1]
         batch_num_tokens_for_loss = move_to_device(
@@ -377,15 +421,28 @@ class TransformerTrainModule(TrainModule):
             # get an artificially *low* loss for these batches. But it is really hard (and slow)
             # to do this properly in a distributed setup. We add back in the full number of tokens
             # for the loss so that each rank contributes to the loss calculation fairly.
+            # 直观上可以把它理解为：
+            #   “虽然这条样本被屏蔽了，不想让它贡献真实 loss，
+            #    但为了分布式归一化一致性，仍然把它对应的 token 数算回分母里。”
             batch_num_tokens_for_loss += (~instance_mask).sum() * batch_num_tokens_per_instance
 
         # Batch losses to record.
+        # 中文导读：这里累积的是“整个 batch 在当前 rank 上的日志统计值”，
+        # 不是 optimizer 直接使用的参数张量。
         ce_batch_loss = move_to_device(torch.tensor(0.0), self.device)
         z_batch_loss: Optional[torch.Tensor] = None
         if self.z_loss_multiplier is not None:
             z_batch_loss = move_to_device(torch.tensor(0.0), self.device)
 
         # Split into micro-batches.
+        # 中文导读：rank_microbatch_size 的单位是 token，不是样本数。
+        # 每个 rank 一次处理 rank_microbatch_size // seq_len 条序列。
+        # 工作站迁移时，这是最直接的显存控制旋钮。
+        # 例如：
+        #   batch["input_ids"].shape = (8, 1024)
+        #   rank_microbatch_size = 2048 tokens
+        # 则每个 micro-batch 的样本数 = 2048 // 1024 = 2
+        # 最终会切成 4 个 micro-batch，每个形状大致是 (2, 1024)。
         if self.rank_microbatch_size < (seq_len := batch["input_ids"].shape[1]):
             raise RuntimeError(
                 f"Microbatch size ({self.rank_microbatch_size}) is too small relative to sequence length ({seq_len})"
@@ -396,9 +453,20 @@ class TransformerTrainModule(TrainModule):
         # Train one micro-batch at a time.
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
             with self._train_microbatch_context(micro_batch_idx, num_micro_batches):
+                # 中文导读：_prepare_batch() 会把当前 micro-batch 整理成模型真正要吃的输入：
+                #   input_ids.shape == (b, s)
+                #   labels.shape    == (b, s)
+                #   model_kwargs    里可能有 doc_lens / cu_doc_lens / attention_bias 等。
                 input_ids, labels, model_kwargs = self._prepare_batch(micro_batch)
 
                 # Run forward pass, get losses.
+                # 中文导读：Transformer.forward() 在传入 labels 时直接返回
+                # LMOutputWithLoss；这里 return_logits=False 是为了省显存，只保留训练所需 loss。
+                # 返回值语义：
+                #   logits: 这里显式不要，所以是 None
+                #   loss:   真正 backward 的标量，已经按 batch_num_tokens_for_loss 归一化
+                #   ce_loss: 仅用于日志记录的 CE 标量
+                #   z_loss:  仅用于日志记录的 z-loss 标量（如果开启）
                 _, loss, ce_loss, z_loss = self.model_forward(
                     input_ids,
                     labels=labels,
@@ -411,6 +479,8 @@ class TransformerTrainModule(TrainModule):
                 )
 
                 # Update total batch CE and Z loss.
+                # 中文导读：ce_batch_loss / z_batch_loss 把多个 micro-batch 的日志值加总起来，
+                # 从而得到“这个完整 batch”的统计结果。
                 ce_batch_loss += get_local_tensor(ce_loss.detach())
                 del ce_loss
                 if z_batch_loss is not None:
@@ -419,10 +489,17 @@ class TransformerTrainModule(TrainModule):
                     del z_loss
 
                 # Run backward pass.
+                # 中文导读：这里每个 micro-batch 都 backward，梯度累积到同一组参数上；
+                # 真正的 optimizer.step() 由 Trainer 在完整 batch 结束后调用。
+                # 因此如果一个 batch 被拆成 4 个 micro-batch，那么会发生：
+                #   backward() x 4 次
+                #   optimizer.step() x 1 次
                 loss.backward()
 
         del batch  # In case this helps with memory utilization.
 
+        # 中文导读：post_batch() 给模型做 batch 结束后的清理或辅助统计，
+        # 例如 MoE auxiliary metrics、FP8/FSDP 相关状态等扩展点。
         self.model.post_batch(dry_run=dry_run)
 
         if dry_run:
@@ -430,6 +507,8 @@ class TransformerTrainModule(TrainModule):
             return
 
         # Record loss metrics.
+        # 中文导读：到这里，参数梯度已经就绪；这一段只负责把“本 batch 的训练日志”
+        # 记录到 Trainer 的 metrics 系统，供 console/logger/callback 使用。
         if isinstance(self.optim, SkipStepOptimizer):
             # Need to reduce the loss right away for the SkipStepOptimizer.
             if is_distributed():
@@ -443,6 +522,9 @@ class TransformerTrainModule(TrainModule):
             self.record_ce_loss(ce_batch_loss, ReduceType.mean)
         if z_batch_loss is not None:
             assert self.z_loss_multiplier is not None
+            # 这里记录两份：
+            #   1) 缩放后的 Z loss：实际加进总 loss 的那部分
+            #   2) 未缩放 Z loss：便于判断正则项本身的量级
             self.record_metric(
                 "Z loss",
                 z_batch_loss,

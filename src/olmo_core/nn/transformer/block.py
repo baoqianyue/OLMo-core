@@ -148,6 +148,10 @@ class TransformerBlock(TransformerBlockBase):
         loss_div_factor: Optional[Union[torch.Tensor, float]] = None,
         **kwargs,
     ) -> torch.Tensor:
+        # 中文导读：标准 pre-norm Transformer block。
+        # 路径是 x -> norm -> sequence_mixer(attention 等) -> residual，
+        # 再 h -> norm -> MLP -> residual。self.attention 名称为兼容旧 checkpoint，
+        # 实际可以是任意 SequenceMixer。
         del loss_div_factor
         h = self.attention_residual_stream(x, self.attention(self.attention_norm(x), **kwargs))
         return self.feed_forward_residual_stream(h, self.feed_forward(self.feed_forward_norm(h)))
@@ -155,6 +159,13 @@ class TransformerBlock(TransformerBlockBase):
     def apply_tp(
         self, tp_mesh: DeviceMesh, *, input_layout: Placement, float8_enabled: bool = False
     ):
+        # 中文导读：这是 TP 在单个 TransformerBlock 内的具体落点。
+        # Transformer.apply_tp() 会遍历所有 block 调到这里。
+        #
+        # 这里先把 block 输入调整成 sequence-sharded 布局 Shard(1)，即 hidden
+        # 的 sequence 维被 TP ranks 切开；然后 attention_norm/dropout/ffn_norm
+        # 等按 token 独立的模块使用 SequenceParallel；attention 和 feed_forward
+        # 再分别进入它们自己的 apply_tp() 做 QKV/MLP 矩阵分片。
         parallelize_module(
             self,
             device_mesh=tp_mesh,
@@ -204,6 +215,9 @@ class TransformerBlock(TransformerBlockBase):
         ring: Optional[RingContextParallelStyle] = None,
         uly: Optional[UlyssesContextParallelStyle] = None,
     ):
+        # 中文导读：CP 在普通 TransformerBlock 中主要影响 attention。
+        # feed_forward 是逐 token 的 MLP，不需要跨 context chunk 看其它 token；
+        # attention 则必须能看到其它 CP rank 上的 K/V 或上下文片段。
         self.attention.apply_cp(cp_mesh, ring=ring, uly=uly)
 
     def apply_fsdp(
@@ -213,6 +227,11 @@ class TransformerBlock(TransformerBlockBase):
         wrapping_strategy: TransformerDataParallelWrappingStrategy = TransformerDataParallelWrappingStrategy.full,
         **fsdp_kwargs,
     ):
+        # 中文导读：这是 FSDP 在单个 block 内的包裹点。
+        #   fine_grained: attention、feed_forward、block root 都分别 fully_shard，
+        #                 峰值显存更低，但 wrapper/通信更细碎。
+        #   full/blocks:  直接包整个 block，结构简单，通信粒度更粗。
+        # Transformer.apply_fsdp() 会在模型级别继续包 embeddings/lm_head/root。
         if wrapping_strategy == TransformerDataParallelWrappingStrategy.fine_grained:
             fsdp_att = cast(FSDPModule, fully_shard(self.attention, mesh=dp_mesh, **fsdp_kwargs))
             fsdp_mlp = cast(FSDPModule, fully_shard(self.feed_forward, mesh=dp_mesh, **fsdp_kwargs))

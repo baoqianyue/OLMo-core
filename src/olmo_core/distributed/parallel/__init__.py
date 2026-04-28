@@ -153,6 +153,16 @@ def build_world_mesh(
 
     device_type = device_type or get_default_device().type
     dp_world_size = get_world_size()
+    # 中文导读：dp_world_size 一开始等于全局 rank 数，也就是 torchrun
+    # 启动的总进程数。下面每启用一种“模型内并行”(PP/CP/TP/EP)，都会先
+    # 从总 world size 里扣掉对应 degree，剩下的才是数据并行维度大小。
+    #
+    # 例子：torchrun --nproc-per-node=8，配置 cp.degree=2、tp.degree=2。
+    # 初始 dp_world_size=8；除以 CP 后是 4；再除以 TP 后是 2。
+    # 最终 mesh 形状会包含：
+    #   dp=2, cp=2, tp=2
+    # 这表示一共有 2 个数据并行副本；每个副本内部用 2-way CP 和 2-way TP
+    # 协同训练同一个 batch shard。
 
     if pp is None and tp is None and cp is None and dp is None and ep is None:
         return init_device_mesh(device_type, (dp_world_size,), mesh_dim_names=(MeshDimName.dp,))
@@ -163,6 +173,9 @@ def build_world_mesh(
         )
 
     # Validate parallelism degrees while adjust the DP degree.
+    # 中文导读：这些检查保证每个并行 degree 都能整除当前剩余 world size。
+    # 如果 8 卡上设置 tp.degree=3，就无法均匀分组，因此必须报错。
+    # 顺序按 mesh 维度设计：PP -> DP/HSDP -> EP -> CP -> TP。
     if pp is not None:
         if pp.degree < 1 or dp_world_size % pp.degree != 0:
             raise OLMoConfigurationError(
@@ -204,11 +217,19 @@ def build_world_mesh(
     dims: List[int] = []
 
     # Pipeline parallel first.
+    # 中文导读：PP 把不同层放到不同 stage/rank 上，所以它作为最外层维度。
+    # 例如 pp.degree=4 表示模型被切成 4 个流水线 stage。
     if pp is not None:
         names.append(MeshDimName.pp)
         dims.append(pp.degree)
 
     # Then data parallel.
+    # 中文导读：FSDP 使用 dp 维度；HSDP 会把数据并行拆成两个维度：
+    #   dp_replicate：复制完整分片组，通常跨节点；
+    #   dp_shard：每个复制组内部做 FSDP 分片，通常节点内多卡。
+    # 例子：16 卡、2 节点、HSDP 默认可能得到
+    #   dp_replicate=2, dp_shard=8
+    # 表示每个节点内 8 卡分片，节点之间再做副本同步。
     if dp.name == DataParallelType.hsdp:
         num_replicas, shard_degree = dp.get_replicate_and_shard_degree(dp_world_size)
         names.append(MeshDimName.dp_replicate)
@@ -233,11 +254,16 @@ def build_world_mesh(
             dims.append(ep.degree)
 
     # Context parallel.
+    # 中文导读：CP 维度在数据并行之后、TP 之前。数据加载时同一 CP 组内
+    # 通常要拿到同一批样本，因为它们只是把同一条长序列按上下文切开；
+    # 参数同步时 CP 维度又要和 DP 一起参与梯度同步。
     if cp is not None:
         names.append(MeshDimName.cp)
         dims.append(cp.degree)
 
     # And lastly tensor parallel.
+    # 中文导读：TP 放在最后，方便模型内部按最后一维 sub-mesh 获取
+    # tensor-parallel group，例如切 attention heads 或 MLP hidden dim。
     if tp is not None:
         names.append(MeshDimName.tp)
         dims.append(tp.degree)
@@ -328,6 +354,14 @@ def _get_model_mesh(device_mesh: DeviceMesh) -> Tuple[DeviceMesh, Tuple[str, ...
     # NOTE: We do this because for param-synchronization purposes a CP group behaves like an extra
     # DP replica set. CP splits the context across ranks but every CP rank still holds a copy of
     # the model parameters. Gradients need to be reduced across the union of DP ranks and CP ranks.
+    # 中文导读：这里是理解 CP 的关键。CP 虽然把序列切开，但没有把参数切开；
+    # 同一 CP 组里的每个 rank 都有模型参数副本。因此对 DDP/FSDP 这类“参数同步”
+    # wrapper 来说，CP 维度必须并入 DP 模型 mesh，否则不同 CP rank 的梯度不会
+    # 正确汇总。
+    #
+    # 例子：world mesh = (dp=2, cp=4, tp=1)。数据加载视角下只有 dp=2，
+    # 因为同一 CP 组 4 个 rank 处理同一批样本的不同 sequence chunk；
+    # 模型同步视角下则需要 dp_cp=8，把 2 个 DP 副本和 4 个 CP 分片都纳入同步。
     if MeshDimName.cp in dim_names:
         last_dp_dim = dim_names[dim_names.index(MeshDimName.cp) - 1]
         assert last_dp_dim.startswith("dp")

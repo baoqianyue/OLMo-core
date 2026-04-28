@@ -524,6 +524,9 @@ class Transformer(nn.Module):
 
         :returns: The logits if ``labels`` is ``None`` or the losses if ``labels`` is not ``None``.
         """
+        # 中文导读：_prepare_inputs() 统一处理设备迁移、labels、loss 参数、
+        # 文档边界信息和 context parallel 的序列切分。forward 主体只保留
+        # embeddings -> blocks -> lm_head 的模型拓扑。
         (
             input_ids,
             labels,
@@ -544,6 +547,9 @@ class Transformer(nn.Module):
 
         # Get embeddings but pass-through for non-existent layers to allow easy
         # pipeline parallel configuration.
+        # 中文导读：pipeline parallel 会把一个完整模型切成多个 stage。
+        # 非首 stage 没有 embeddings，非末 stage 没有 lm_head，因此这里允许
+        # input_ids 实际上是上一 stage 输出的 hidden states。
         h = self.embeddings(input_ids) if self.embeddings is not None else input_ids
         if self.embeddings is not None and self.embed_scale is not None:
             h = h * self.embed_scale
@@ -551,6 +557,8 @@ class Transformer(nn.Module):
             h = self.embedding_norm(h)
 
         # Run each block.
+        # 中文导读：blocks 是按字符串下标保存的 ModuleDict，方便 checkpoint
+        # key 稳定，也方便按层做 pipeline split、activation checkpointing 和 FSDP 包裹。
         for block_key, block in self.blocks.items():
             block_idx = int(block_key)
             block_kwargs = per_block_kwargs.get(block_idx, {})
@@ -561,6 +569,8 @@ class Transformer(nn.Module):
 
         # Get final logits but again pass-through in case of pipeline parallelism.
         if self.lm_head is not None:
+            # 中文导读：传入 labels 时，lm_head 会直接计算 CE/Z loss；
+            # 不传 labels 时则返回 logits，用于推理或外部自定义 loss。
             if self.compile_enabled:
                 mark_dynamic(h, (0, 1), strict=False)
                 if labels is not None:
@@ -617,6 +627,16 @@ class Transformer(nn.Module):
                 "Got 'float8_enabled=False', but FP8 has already been enabled"
             )
 
+        # 中文导读：TP 的目标是把“单层内部的大张量计算”切到多个 rank。
+        # 这里的典型布局是：
+        #   - embeddings 输出沿 sequence 维 shard，变成 Shard(1)；
+        #   - norm 使用 SequenceParallel，沿 sequence 维并行；
+        #   - 每个 block 内部再切 attention/MLP；
+        #   - lm_head 接收 sequence-sharded hidden，同时 labels 仍是 replicated。
+        #
+        # 例子：hidden h 原本形状是 [B=2, S=1024, D=4096]，tp.degree=2。
+        # SequenceParallel 后每个 TP rank 看到本地 [2, 512, 4096] 或等价 DTensor
+        # shard；block 内部的线性层/attention heads 再按各自策略分片通信。
         if self.embeddings is not None:
             parallelize_module(
                 self.embeddings,
@@ -656,6 +676,15 @@ class Transformer(nn.Module):
         :param ring: The ring context parallel style.
         :param uly: The ulysses context parallel style.
         """
+        # 中文导读：CP 处理的是“长序列太长，单卡放不下完整上下文”的问题。
+        # 它把 sequence/context 维度分给多个 rank，但每个 rank 仍有一份模型参数。
+        # ring/ulysses 是两种 attention 通信风格：
+        #   - ring：各 rank 以环形方式交换 K/V 或局部 attention 所需信息；
+        #   - ulysses：常见做法是在 sequence parallel 和 head parallel 间 all-to-all。
+        #
+        # 例子：S=8192、cp.degree=4 时，每个 rank 先处理约 2048 token。
+        # apply_cp() 会给 attention block 装上对应的通信/load-balancing 逻辑，
+        # lm_head 也要知道 CP 存在，以便 loss 分母和序列 shard 对齐。
         if ring is not None:
             self._cp_load_balancer = ring.load_balancer.build(cp_mesh)
         elif uly is not None:
@@ -687,6 +716,14 @@ class Transformer(nn.Module):
             Requires compilation to be enabled.
         """
 
+        # 中文导读：activation checkpointing 不保存被包裹模块的所有中间激活，
+        # 反向传播时重新跑一遍对应 forward。代价是计算量增加，收益是显存下降。
+        #
+        # 常用选择：
+        #   - full：每个 transformer block 都 checkpoint，最省显存；
+        #   - selected_blocks + block_interval=2：只包 0,2,4... 层；
+        #   - selected_modules + modules=["blocks.*.feed_forward"]：只包匹配模块；
+        #   - budget：交给 torch.compile 的预算机制，activation_memory_budget 越小越激进。
         if mode == TransformerActivationCheckpointingMode.budget:
             if activation_memory_budget is None:
                 raise ValueError("'activation_memory_budget' is required for 'budget' mode")
@@ -740,6 +777,9 @@ class Transformer(nn.Module):
                 log.info(f"Wrapped '{name}' for activation checkpointing")
                 wrapped_modules.add(name)
         else:
+            # 中文导读：按 block 包裹时，checkpoint wrapper 会替换 self.blocks
+            # 里的模块对象。后续 FSDP 会再包这些已经 checkpoint 的 block。
+            # 这就是为什么 parallelize_model() 里 AC 要排在 FSDP 之前。
             for block_idx, block in enumerate(self.blocks.values()):
                 if mode == TransformerActivationCheckpointingMode.selected_blocks:
                     assert block_interval is not None
@@ -815,6 +855,16 @@ class Transformer(nn.Module):
         # which can be expensive and non-overlapped
         reshard_after_forward = False if pp_enabled else True
 
+        # 中文导读：FSDP2 会把参数按 dp_mesh 分片保存。forward 前需要 all-gather
+        # 当前模块参数，forward 后可以 reshard 释放完整参数，backward 时再按需
+        # all-gather/reduce-scatter。相比 DDP 每卡保存完整模型，FSDP 更省参数、
+        # 梯度和 optimizer state 显存。
+        #
+        # wrapping_strategy 的直觉：
+        #   - full：block、embedding、norm、lm_head 等都按策略分别包裹；
+        #   - blocks：主要包 block，lm_head 不单独包；
+        #   - fine_grained：block 内部的 attention/MLP 等也更细粒度包裹。
+        # 更细粒度通常更省峰值显存，但通信和 wrapper 开销可能更高。
         for block in self.blocks.values():
             block = cast(TransformerBlockBase, block)
             block.apply_fsdp(
@@ -843,12 +893,18 @@ class Transformer(nn.Module):
         fully_shard(self, reshard_after_forward=reshard_after_forward, **fsdp_config)
         # Some inputs need to be on CPU initially, but FSDP will move everything to model's
         # device if we don't hide it.
+        # 中文导读：某些输入，例如长度元信息或 packed sequence 辅助张量，可能必须先留在 CPU。
+        # FSDP/DDP 的默认 hook 可能会尝试把所有输入搬到模型设备；这里通过 pre-hook
+        # 暂时隐藏这些 CPU 输入，避免被 wrapper 误搬。
         self.register_forward_pre_hook(_hide_cpu_inputs_from_torch, prepend=True, with_kwargs=True)
         self.register_forward_pre_hook(
             _unhide_cpu_inputs_from_torch, prepend=False, with_kwargs=True
         )
 
         if prefetch_factor > 0:
+            # 中文导读：prefetch_factor 控制 FSDP 提前 all-gather 后续 block 参数。
+            # 例如 prefetch_factor=2 时，当前 block forward 时会提示 FSDP 预取后面
+            # 两个 block。这样可能隐藏通信延迟，但也会增加同时驻留的参数显存。
             blocks = cast(List[FSDPModule], list(self.blocks.values()))
             for i in range(len(blocks)):
                 block = blocks[i]
@@ -1084,6 +1140,13 @@ class MoETransformer(Transformer):
             cast(MoETransformerBlock, block).reset_metrics()
 
     def apply_ep(self, ep_mesh: DeviceMesh, **kwargs):
+        # 中文导读：这是 EP 在 MoETransformer 上的实际执行点。
+        # parallelize_model() 只有在 ep_config 不为空且模型 is_moe=True 时才会调到这里。
+        # 它会跳过 dense block，只把 MoE block 里的 experts/router 相关模块交给
+        # MoETransformerBlock.apply_ep() 继续处理。
+        #
+        # 例子：如果某些层是 MoE block、ep.degree=8，那么这些 block 中的 experts
+        # 会按 ep_mesh 分布到 8 个 expert-parallel rank；非 MoE block 不受影响。
         for block in self.blocks.values():
             if not block.is_moe:
                 continue
@@ -1097,6 +1160,9 @@ class MoETransformer(Transformer):
         reduce_dtype: torch.dtype = torch.float32,
         pp_enabled: bool = False,
     ):
+        # 中文导读：MoE + FSDP 需要在普通 Transformer.apply_fsdp() 之前预处理 experts。
+        # experts 可能已经被 EP/TP/PP 改造，FSDP 是否 forward 后 reshard 也要随之调整，
+        # 否则可能造成额外 all-gather 或跨 mesh 状态不一致。
         for block in self.blocks.values():
             if not block.is_moe:
                 continue
@@ -1113,6 +1179,8 @@ class MoETransformer(Transformer):
             )
 
     def prepare_experts_for_ddp(self, world_mesh: DeviceMesh):
+        # 中文导读：MoE + DDP 也要先处理 expert 参数所在的并行 mesh，
+        # 再让 DDP 对普通参数副本做梯度同步。
         for block in self.blocks.values():
             if not block.is_moe:
                 continue

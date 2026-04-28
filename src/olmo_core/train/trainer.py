@@ -671,6 +671,9 @@ class Trainer:
         Fit the model, potentially loading a checkpoint first depending on the
         :data:`load_strategy`.
         """
+        # 中文导读：Trainer 是外层调度器，不直接理解 Transformer。
+        # 它负责 checkpoint 恢复、callback 生命周期、dry-run、epoch/step 循环、
+        # metrics 聚合和最终清理；真正的 forward/backward 在 TrainModule.train_batch()。
         self._canceled = False
         self._cancel_reason = None
         self._canceling_rank = None
@@ -684,6 +687,8 @@ class Trainer:
             # Try loading from the save folder first. The save folder is used for continuing
             # existing runs that failed or were preempted, so we always load trainer state and
             # optimizer state.
+            # 中文导读：save_folder 优先级最高，用于断点续训；这里会恢复模型、优化器、
+            # Trainer 状态和 DataLoader 状态，保证 token 顺序和 step 计数连续。
             self.maybe_load_checkpoint(
                 self.save_folder, load_trainer_state=True, load_optim_state=True
             )
@@ -735,10 +740,14 @@ class Trainer:
                 return
 
             # Do a dry-run for compiling and catching OOMs early.
+            # 中文导读：dry-run 会先走一遍 batch，提前触发 torch.compile、FSDP 初始化
+            # 和显存分配。工作站调参时，它能更早暴露 sequence_length/microbatch 过大的问题。
             if not self.training_complete:
                 self._dry_run_batch()
 
             # Iterate over epochs until done.
+            # 中文导读：_fit_epoch() 内部会 reshuffle DataLoader，逐 batch 调
+            # TrainModule.train_batch()、optim_step()、zero_grads()，并触发 callbacks。
             while not self.training_complete:
                 self._fit_epoch()
         except BaseException as exc:

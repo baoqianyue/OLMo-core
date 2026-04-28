@@ -27,6 +27,9 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class ExperimentConfig(Config):
+    # 中文导读：官方训练脚本最终都会收敛成这个配置对象。
+    # 它把一次实验拆成五块：模型、数据集、DataLoader、TrainModule 和 Trainer。
+    # 研究主链路时，顺着 main() 里这五个字段的 build() 往下追即可。
     model: TransformerConfig
     dataset: NumpyDatasetConfig
     data_loader: NumpyDataLoaderConfig
@@ -108,6 +111,8 @@ def main(
     config_builder: Callable[[argparse.Namespace, List[str]], ExperimentConfig],
     parser: Optional[argparse.ArgumentParser] = None,
 ) -> None:
+    # 中文导读：这是官方脚本的通用入口。每个 official script 只负责实现
+    # build_config()，这里负责解析 CLI、初始化分布式环境、构造组件并启动训练。
     opts, overrides = _parse_args(parser)
     if opts.dry_run:
         prepare_cli_environment()
@@ -119,6 +124,8 @@ def main(
         return
 
     if opts.train_single:
+        # 中文导读：单进程调试时禁用 DP/TP，适合在个人工作站先排查配置、
+        # 数据格式和 forward/backward 是否能跑通。
         if (dp_config := getattr(config.train_module, "dp_config", None)) is not None:
             log.warning(
                 "'dp_config' is set to %s, but you can't use data parallelism when running on a single node. Disabling.",
@@ -142,6 +149,8 @@ def main(
     seed_all(config.init_seed)
 
     # Build components.
+    # 中文导读：init_device="meta" 先创建无真实存储的参数壳，随后 TrainModule
+    # 会根据 FSDP/DDP/TP/CP 等并行策略 materialize 到目标设备，降低初始化期显存峰值。
     model = config.model.build(init_device="meta")
     train_module = config.train_module.build(model)
     dataset = config.dataset.build()

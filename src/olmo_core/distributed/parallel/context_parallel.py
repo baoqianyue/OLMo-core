@@ -13,6 +13,13 @@ class ContextParallelConfig(Config):
     Configuration class for context parallelism (CP).
     """
 
+    # 中文导读：CP 的 degree 表示“一条序列沿 context/sequence 维切成几份”。
+    # 例如 seq_len=8192、degree=4 时，每个 CP rank 先持有约 2048 token。
+    # build_world_mesh() 会把这个 degree 变成名为 "cp" 的 mesh 维度；
+    # common.py::parallelize_model() 会调用 get_cp_mesh() 再传给 Transformer.apply_cp()。
+    #
+    # 和 TP 不同，CP 不主要切模型参数；同一 CP 组的 rank 处理同一批样本的
+    # 不同序列片段，因此 data loader 不能把它们当成不同数据副本。
     degree: int
     """
     The CP degree.
@@ -34,6 +41,15 @@ def all_to_all_single_cp2hp(
     :returns: The output tensor with shape ``[B, T, H/CP, D]`` or ``[B, T, H/CP]`` (matching input
         dimensionality), partitioned along the head dimension.
     """
+    # 中文导读：这是 CP/Ulysses 类通信里很核心的形状变换：
+    #   cp2hp = context-parallel -> head-parallel
+    # 输入先按序列切分：[B, T/CP, H, D]，每个 rank 只拿一段 token；
+    # all-to-all 后变成按 head 切分：[B, T, H/CP, D]，每个 rank 拿完整序列
+    # 但只负责一部分 heads。
+    #
+    # 例子：CP=2, 输入每 rank [B, 4096, 32, D]。
+    # 输出每 rank [B, 8192, 16, D]。
+    # 这让某些 attention 计算可以在“完整上下文 + 部分 heads”的布局下执行。
     assert input_.dim() in (
         3,
         4,

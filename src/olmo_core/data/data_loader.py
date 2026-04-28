@@ -90,6 +90,9 @@ class DataLoaderBase(ABC):
         dp_rank: int = 0,
         fs_local_rank: Optional[int] = None,
     ):
+        # 中文导读：OLMo-core 的 DataLoader 是分布式、确定性、可 checkpoint 的。
+        # global_batch_size 是所有 data-parallel rank 的总 batch；每个 rank 只产生
+        # rank_batch_size = global_batch_size // dp_world_size 的本地切片。
         if is_url(work_dir):
             raise OLMoConfigurationError(
                 f"'work_dir' should be a local path, not a URL ('{work_dir}')."
@@ -114,6 +117,8 @@ class DataLoaderBase(ABC):
 
     @global_batch_size.setter
     def global_batch_size(self, new_global_batch_size: int):
+        # 中文导读：训练中允许按整数倍调整 global batch size，但必须对齐已经处理的
+        # batch 数，避免恢复或调度时重复/跳过数据。
         if not isinstance(new_global_batch_size, int):
             raise TypeError(f"expected int, got {type(new_global_batch_size)}")
 

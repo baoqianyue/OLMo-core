@@ -639,6 +639,16 @@ class Attention(SequenceMixer):
         use_local_output: bool = True,
         float8_enabled: bool = False,
     ):
+        # 中文导读：这是标准 attention 的 TP 具体实现点。
+        # TransformerBlock.apply_tp() 会调用到这里。
+        #
+        # 分片直觉：
+        #   w_q/w_k/w_v 使用 colwise_parallel，输出按 heads/hidden 切开；
+        #   w_out 使用 rowwise_parallel，把各 TP rank 的部分 attention 输出合回去；
+        #   q_norm/k_norm 如果存在，使用 SequenceParallel 适配 sharded heads。
+        #
+        # 例子：32 heads、tp.degree=2 时，每个 TP rank 主要负责约 16 个 heads
+        # 的 Q/K/V 和 attention 计算，再通过 w_out 的 rowwise 布局聚合。
         rowwise_parallel, colwise_parallel, prepare_module_input = get_tp_wrappers(
             float8_enabled=float8_enabled
         )
@@ -700,6 +710,10 @@ class Attention(SequenceMixer):
         :param ring: The ring context parallel style.
         :param uly: The ulysses context parallel style.
         """
+        # 中文导读：这是 attention 的 CP 具体入口。
+        # Transformer.apply_cp() -> block.apply_cp() -> attention.apply_cp() -> backend.apply_cp()。
+        # CP 的核心通信在 backend 里实现，因为不同 attention backend
+        # 如 flash_2 / TransformerEngine 支持的 ring 或 Ulysses 通信方式不同。
         self.backend.apply_cp(cp_mesh, ring=ring, uly=uly)
 
     def init_weights(

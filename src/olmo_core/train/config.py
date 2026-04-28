@@ -155,6 +155,10 @@ class TrainerConfig(Config):
         :param dp_process_group: The data parallel process group. Defaults to
             :data:`olmo_core.train.train_module.TrainModule.dp_process_group`.
         """
+        # 中文导读：TrainerConfig.build() 只做装配，不做训练。
+        # 它把 TrainModule、DataLoader、Checkpointer 和 callbacks 组合成 Trainer。
+        # 个人工作站迁移时，常看的字段是 save_folder、work_dir、device、
+        # max_duration、metrics_collect_interval 和 checkpoint callback。
         kwargs = self.as_dict(exclude_none=True, recurse=False)
 
         if dp_process_group is None:
@@ -164,6 +168,8 @@ class TrainerConfig(Config):
 
         work_dir = kwargs.pop("work_dir", None)
         if work_dir is None:
+            # 中文导读：work_dir 必须是本地路径，用于数据预处理缓存和临时文件。
+            # save_folder 是本地目录时直接复用；远程保存时退回 /tmp。
             if not is_url(self.save_folder):
                 work_dir = self.save_folder
             else:
@@ -182,6 +188,9 @@ class TrainerConfig(Config):
             process_group=checkpointer_pg, **checkpointer_kwargs
         )
 
+        # 中文导读：callbacks 可以已经是实例，也可以是 CallbackConfig。
+        # 后者需要拿到 trainer 后再 build，因为 evaluator/logger/checkpointer
+        # 往往依赖 trainer 的状态和进程组。
         all_callbacks = kwargs.pop("callbacks")
         callbacks = {k: cb for k, cb in all_callbacks.items() if not isinstance(cb, CallbackConfig)}
         callback_configs = {
