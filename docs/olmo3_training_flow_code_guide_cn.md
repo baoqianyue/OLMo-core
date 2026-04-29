@@ -176,6 +176,24 @@ dp_config=TransformerDataParallelConfig(
 
 这里使用 HSDP，也就是 hybrid sharded data parallel。可以把它理解成 FSDP 和数据并行复制的组合：参数、梯度、optimizer state 在 shard 组内切分，同时在 replica 维度上复制模型副本。`param_dtype=bfloat16` 表示模型参数通信/存储主要用 bf16，省显存；`reduce_dtype=float32` 表示梯度归约用 fp32，提高数值稳定性；`wrapping_strategy=blocks` 表示主要按 Transformer blocks 粒度做 FSDP/HSDP 包裹，而不是把 block 内部 attention/MLP 再切得更细。
 
+这里涉及的几个并行训练术语可以先拆开理解：
+
+- **Data Parallel / 数据并行**：多张 GPU 各自拿不同 batch 数据，跑同一份模型，最后把梯度同步起来。最朴素的形式是 DDP，也就是每张 GPU 都常驻完整参数、完整梯度和完整 optimizer state；它简单高效，但对 7B/32B 这类模型显存压力很大。
+- **FSDP / Fully Sharded Data Parallel**：把“每张卡都保存完整模型状态”改成“模型状态分片保存”。参数、梯度、optimizer state 会按 rank 切成 shard；计算某个被包裹模块时再临时 all-gather 出完整参数，算完后 reshard/释放。
+- **HSDP / Hybrid Sharded Data Parallel**：把 FSDP 分片和普通数据并行副本结合起来。一个 replica 内部由多张 GPU 组成 shard group，共同保存一份模型的参数分片；多个 replica 处理不同数据，反向后同步梯度，保持逻辑模型一致。
+
+可以用一个 16 卡例子理解：
+
+```text
+Replica 0: GPU0..GPU7   共同保存一份模型的 8 份 shard
+Replica 1: GPU8..GPU15  共同保存另一份模型的 8 份 shard
+
+shard 维度: 每个 replica 内部做参数/梯度/optimizer state 分片
+replica 维度: 多份逻辑模型副本处理不同数据并同步梯度
+```
+
+报告 Table 34 里的 `DP-shard` 和 `DP-rep` 就是在描述这个二维结构：`DP-shard` 是每个 FSDP shard 组里有多少张 GPU，`DP-rep` 是有多少个这样的 replica 组。7B pretraining 脚本没有显式写 `shard_degree`，所以具体 shard/replica 形状由 `build_world_mesh()` 根据 world size 和默认规则推导；32B 脚本会显式写 `shard_degree=64`，因为 32B 显存压力更高，也更需要稳定控制分片规模。
+
 `bf16 -> fp32` 这个转换本身不会新增精度损失，因为 fp32 可以精确表示所有 bf16 数值；但它也不能恢复 bf16 阶段已经丢掉的小数位。`reduce_dtype=float32` 的价值在于跨 rank 梯度累加时用 fp32 做加和，减少归约过程中继续使用 bf16 累加带来的舍入误差。可以理解为：参数常驻/通信用 bf16 省显存和带宽，梯度归约时提升到 fp32 是为了让“多卡求和”这一步更稳。
 
 这里几个词容易混在一起，可以拆开看：
@@ -1452,4 +1470,3 @@ OLMo3 report
 - `save_folder` 用于 checkpoint，`work_dir` 用于本地数据缓存；远程 `save_folder` 不能直接当 `work_dir`。
 - midtraining 的 YAML mix 是“目标比例”，最终 token 数会按 sequence length 和 global batch size round 到完整 instance。
 - 长上下文的 `generate_doc_lengths=True` 不是普通 metadata，它会影响模型 forward 的文档边界处理和 CP 分片。
-
