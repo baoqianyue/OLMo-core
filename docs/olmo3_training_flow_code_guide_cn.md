@@ -176,6 +176,111 @@ dp_config=TransformerDataParallelConfig(
 
 这里使用 HSDP，也就是 hybrid sharded data parallel。可以把它理解成 FSDP 和数据并行复制的组合：参数、梯度、optimizer state 在 shard 组内切分，同时在 replica 维度上复制模型副本。`param_dtype=bfloat16` 表示模型参数通信/存储主要用 bf16，省显存；`reduce_dtype=float32` 表示梯度归约用 fp32，提高数值稳定性；`wrapping_strategy=blocks` 表示主要按 Transformer blocks 粒度做 FSDP/HSDP 包裹，而不是把 block 内部 attention/MLP 再切得更细。
 
+`bf16 -> fp32` 这个转换本身不会新增精度损失，因为 fp32 可以精确表示所有 bf16 数值；但它也不能恢复 bf16 阶段已经丢掉的小数位。`reduce_dtype=float32` 的价值在于跨 rank 梯度累加时用 fp32 做加和，减少归约过程中继续使用 bf16 累加带来的舍入误差。可以理解为：参数常驻/通信用 bf16 省显存和带宽，梯度归约时提升到 fp32 是为了让“多卡求和”这一步更稳。
+
+这里几个词容易混在一起，可以拆开看：
+
+- **shard / 分片**：把同一份模型参数拆开存在多张 GPU 上。比如一个 block 的参数有 8 份，`shard_degree=8` 时，每张 GPU 常驻其中一份；真正计算这个 block 前，FSDP 会临时 all-gather 拼出当前计算需要的完整参数，因此显存会短暂升高，计算完再 reshard 释放。FSDP 节省的是“常驻显存”，不是完全消除计算瞬间的完整参数峰值。
+- **replica / 副本**：一整组 shard 合起来构成一份完整模型。HSDP 里可以有多组这样的 shard 组，每组都能独立处理不同数据 batch。比如 16 张 GPU、2 个节点、每节点 8 卡时，默认可能是 `num_replicas=2, shard_degree=8`：每个节点内 8 卡组成一份完整模型分片组，两个节点之间是两份 replica。它们处理不同数据，反向后再同步梯度，让两份 replica 保持一致。
+- **包裹 / wrap**：这里不是抽象说法，而是代码里真的调用 `fully_shard(module, ...)` 给某个 PyTorch `nn.Module` 加 FSDP 管理层。被包裹后的 module 会拥有 FSDP 的 hook 和状态：forward 前自动 all-gather 参数，forward 后按配置 reshard，backward 时做梯度 reduce-scatter，并让 optimizer state 按 shard 管理。
+
+这里的 **hook** 可以理解成“框架挂在 module 生命周期上的自动回调”。你写训练代码时只是调用：
+
+```python
+output = block(x)
+loss.backward()
+```
+
+但 FSDP 包裹后的 `block` 会在这些调用前后自动插入额外动作：
+
+```text
+forward pre-hook:
+  进入 block.forward() 之前，all-gather 当前 block 的完整参数
+
+forward post-hook:
+  block.forward() 结束后，按配置 reshard/释放完整参数
+
+backward hook:
+  反向传播产生梯度后，把梯度 reduce-scatter 回各自 shard
+```
+
+所以 hook 不是模型结构里的新层，也不是你手动调用的函数；它更像 PyTorch/FSDP 在 module 上注册的一组“事件监听器”，在 forward/backward 的关键时间点自动执行通信和状态切换。
+
+在一次 forward 里，同一个 FSDP shard group 内的每个 rank 通常都会 all-gather 当前 block 的完整参数。原因是这些 rank 虽然处理的是不同数据切片，但使用的是同一份模型权重。可以这样理解：
+
+```text
+常驻状态：
+  rank0: block 参数 shard A + 自己的数据切片
+  rank1: block 参数 shard B + 自己的数据切片
+  ...
+  rank7: block 参数 shard H + 自己的数据切片
+
+计算当前 block 前：
+  rank0..rank7 互相 all-gather
+  每个 rank 临时拿到 A+B+...+H，也就是当前 block 的完整参数
+
+计算当前 block 时：
+  rank0 用完整 block 参数处理 rank0 的数据切片
+  rank1 用完整 block 参数处理 rank1 的数据切片
+  ...
+  rank7 用完整 block 参数处理 rank7 的数据切片
+
+计算后：
+  完整参数被 reshard/释放
+  每个 rank 回到只常驻自己那份 shard 的状态
+```
+
+所以你说的“每个 rank 都 gather 当前 block 的参数，只是每个 rank 处理各自分到的数据”是对的。需要补充的是：这个 all-gather 发生在同一个 shard group 内；HSDP 如果有多个 replica，每个 replica 内部各自做 shard group 的 all-gather，不同 replica 处理不同数据，反向后再在 replica 维度同步梯度。
+
+为什么只在每个 replica 内部 all-gather，而不是所有 rank 一起 all-gather？因为一个 replica 的 shard group 已经能拼出一份完整模型参数了。跨 replica 再 all-gather 会把其它副本的同一份逻辑参数也拿过来，信息是重复的，通信和显存都会浪费。
+
+这不会导致模型参数不一致，原因是 HSDP 仍然是数据并行语义：
+
+```text
+初始时：
+  replica0 和 replica1 持有同一份模型参数的不同分片副本，逻辑权重一致
+
+forward/backward 时：
+  replica0 处理数据 batch A，得到梯度 shard
+  replica1 处理数据 batch B，得到梯度 shard
+
+梯度同步时：
+  replica 维度做梯度同步/平均
+  shard 维度做 reduce-scatter，把对应梯度留在对应 shard 上
+
+optimizer step 后：
+  每个 replica 对同一份逻辑参数应用相同的平均梯度更新
+  因此逻辑模型继续保持一致
+```
+
+换句话说，**all-gather 解决的是“一个 replica 内如何临时拼出完整参数来计算”**；**replica 之间的一致性靠反向后的梯度同步和相同的 optimizer 更新来保证**。不同 replica 在 forward 时看到的是同一份逻辑权重，只是处理的数据不同。
+
+`wrapping_strategy=blocks` 的具体含义来自 `Transformer.apply_fsdp()` 和 `TransformerBlock.apply_fsdp()`：
+
+```text
+Transformer
+  embeddings         -> 单独 fully_shard
+  block 0            -> fully_shard 整个 block
+  block 1            -> fully_shard 整个 block
+  ...
+  block N            -> fully_shard 整个 block
+  lm_head            -> blocks 策略下不单独 fully_shard
+  whole Transformer  -> 最外层再 fully_shard 一次
+```
+
+也就是说，一个 Transformer block 作为一个相对完整的计算单元被 FSDP 管理。这个 block 内部仍然包含 attention、feed-forward/MLP、norm 等子模块，但它们不会分别再被 `fully_shard()` 包一层。
+
+如果选择更细的 `fine_grained`，block 内部会更像这样：
+
+```text
+TransformerBlock
+  attention     -> fully_shard
+  feed_forward  -> fully_shard
+  block root    -> fully_shard
+```
+
+更细粒度包裹通常能降低峰值显存，因为 attention 算完后可以更早释放它的完整参数，MLP 再单独 all-gather；代价是 FSDP wrapper 更多、all-gather/reduce-scatter 更碎，通信调度开销也更高。`blocks` 是一个更粗、更简单的折中：显存不一定最低，但通信粒度更大，训练系统更容易跑稳。
+
 ```python
 float8_config=Float8Config(enabled=False)
 ```
@@ -188,11 +293,112 @@ z_loss_multiplier=1e-5
 
 z-loss 是作用在 logits log-sum-exp 上的稳定化正则，防止 logits 尺度不断膨胀。训练时 `LMHead` 会返回 CE loss 和 z-loss，`TransformerTrainModule` 用这个 multiplier 把 z-loss 加进总 loss。报告 Table 33 中的 z-loss weight 也对应 `1e-5`。
 
+更具体地说，语言模型最后会输出一组未归一化分数 `logits`，形状大致是：
+
+```text
+logits[token_position] = [vocab_0_score, vocab_1_score, ..., vocab_N_score]
+```
+
+softmax 概率是：
+
+```text
+softmax(logits_i) = exp(logits_i) / sum_j exp(logits_j)
+```
+
+其中分母的 log 形式就是：
+
+```text
+z = logsumexp(logits) = log(sum_j exp(logits_j))
+```
+
+z-loss 惩罚的是这个 `z` 的平方：
+
+```text
+z_loss = z_loss_multiplier * (logsumexp(logits) ** 2)
+```
+
+在代码里对应 `src/olmo_core/nn/functional/cross_entropy_loss.py`：
+
+```python
+z_squared = logits.logsumexp(-1).pow(2)
+mask = labels != ignore_index
+z_loss = z_loss_multiplier * z_squared
+```
+
+为什么需要它？CE loss 关心的是正确 token 相对其它 token 的概率，而 softmax 对“整体平移”不敏感：如果所有 logits 都加上同一个常数，softmax 概率不变，CE 也几乎不变。但 logits 的绝对尺度如果长期漂大，会让 `exp/logsumexp`、低精度训练、分布式归约和 fused loss kernel 更容易遇到数值压力。z-loss 就像给 logits 的 softmax normalizer 加一个很小的刹车，鼓励模型不要把所有分数整体推得过大。
+
+举个简化例子：
+
+```text
+logits A = [2, 1, 0]
+logits B = [102, 101, 100]
+```
+
+这两组 logits 的 softmax 概率几乎一样，因为 B 只是 A 整体加了 100；CE 主要看相对差距，所以二者 CE 接近。但 B 的 `logsumexp(logits)` 大很多，z-loss 会显著惩罚 B。这正是它要限制的方向：不改变模型学习“哪个 token 更可能”的主目标，只约束 logits 的绝对尺度。
+
+在当前训练链路里，操作顺序是：
+
+```text
+LMHead.forward()
+  -> 计算 logits
+  -> cross_entropy_loss(..., compute_z_loss=True, z_loss_multiplier=1e-5)
+  -> ce_loss
+  -> z_loss
+  -> loss = ce_loss + z_loss
+
+TransformerTrainModule.train_batch()
+  -> 对 loss backward
+  -> 同时把 ce_loss 和 z_loss 分开记录到 metrics
+```
+
+注意这里的 `1e-5` 很小，说明 z-loss 不是主训练目标；主目标仍然是 next-token CE。它只是一个稳定化正则项，作用类似“轻轻压住 logits 尺度”，避免训练后期或异常 batch 把分数推到不必要的大。
+
 ```python
 max_grad_norm=1.0
 ```
 
 梯度裁剪阈值。`optim_step()` 前会计算梯度范数，如果超过 1.0 就按比例缩放。它和 `SkipStepAdamWConfig` 是两层保护：梯度裁剪处理“偏大但仍可更新”的梯度，SkipStep 处理“明显异常、不想更新”的 step。
+
+这里的“梯度范数”默认是所有可训练参数梯度拼在一起后的 L2 norm，可以粗略理解为“这次更新向量的整体长度”：
+
+```text
+total_grad_norm = sqrt(sum_i grad_i^2)
+```
+
+如果 `max_grad_norm=1.0`，裁剪规则大致是：
+
+```text
+如果 total_grad_norm <= 1.0:
+  梯度不变
+
+如果 total_grad_norm > 1.0:
+  scale = 1.0 / total_grad_norm
+  所有梯度都乘以同一个 scale
+```
+
+例如某一步算出来的总梯度范数是 5.0，那么所有参数梯度都会乘以 `1.0 / 5.0 = 0.2`。这样做不会改变梯度方向，只是把这次更新的长度压回阈值以内。直觉上，它像是给 optimizer update 前加了一个速度上限：方向仍然由反向传播决定，但单步不能冲得太猛。
+
+在当前代码里，执行顺序在 `src/olmo_core/train/train_module/transformer/train_module.py::optim_step()`：
+
+```text
+1. 如果 max_grad_norm 不为空：
+     grad_norm = _clip_grad_norm(max_grad_norm)
+     记录 optim/total grad norm
+     如果 optimizer 是 SkipStepOptimizer，把 grad_norm 写入 optim.latest_grad_norm
+
+2. scheduler 根据当前 step/tokens 写入学习率
+
+3. optimizer.step()
+```
+
+注意 `_clip_grad_norm()` 返回的是裁剪前的 `total_norm`。所以日志里的 `optim/total grad norm` 可以用来观察“原始梯度有多大”；而实际传给 optimizer 的梯度已经可能被缩放过。
+
+和 `SkipStepAdamW` 的关系也很重要：
+
+- **梯度裁剪**：当前 step 仍然会更新，只是把梯度整体缩小。适合处理“梯度偏大但还可信”的情况。
+- **SkipStep**：当前 step 可能完全不更新，`step_factor=0`。适合处理 loss 或 grad norm 明显异常、可能污染动量和参数的情况。
+
+所以两者不是重复机制，而是从轻到重的两道保护。先裁剪可以限制普通尖峰的影响；随后 SkipStep 还能根据 loss/grad norm 的滚动统计决定这一步是否已经异常到应该跳过。
 
 ```python
 scheduler=CosWithWarmup(warmup_steps=2000)
@@ -255,6 +461,16 @@ NumpyFSLDatasetConfig.from_src_mix(
 - `src/scripts/merge_hf_checkpoints.py`
 - `src/scripts/reshard_core_checkpoint.py`
 
+这里的 **model soup** 指的是把多个训练得到的 checkpoint 权重做平均/合并，得到一个新的单模型 checkpoint。最简单的形式是：
+
+```text
+W_soup = (W_1 + W_2 + ... + W_n) / n
+```
+
+它不是 ensemble。ensemble 是推理时同时跑多个模型再合并输出；model soup 是在训练后离线合并权重，最终推理时仍然只加载和运行一个模型。
+
+在 32B midtraining 的语境里，可以理解为：用相同架构和相近训练配方跑多个 100B-token midtraining run，它们可能只在数据顺序、seed 或 ingredient 上略有不同；最后把这些 checkpoint 的参数平均，试图抵消单个 run 的随机噪声，让最终模型更稳。这个方法通常要求参与 soup 的模型处在相近的参数区域：同架构、同 tokenizer、同参数命名、训练阶段接近，否则直接平均权重可能没有意义甚至损坏模型。
+
 ### 3.3 Long-context extension
 
 7B 入口：`src/scripts/train/OLMo3/OLMo3-7B-long-context.py`
@@ -301,6 +517,81 @@ activation_memory_budget=0.3
 1. `YaRNRoPEScalingConfig(factor=8, old_context_len=8192)`：把 RoPE 从 8K 扩到 64K。
 2. `cp_degree=8`：把单条 64K 序列切到 8 个 CP rank，每个 rank 约 8K tokens。
 3. `generate_doc_lengths=True`：保留 packed sample 内部文档边界，模型 forward 时生成 `cu_doc_lens`，让 attention/CP 能避免不合理跨文档依赖。
+
+#### 3.3.1 RoPE / YaRN 如何实现上下文扩充
+
+RoPE，也就是 rotary positional embedding，不是把一个“位置向量”加到 token embedding 上，而是在 attention 里对 Q/K 做旋转。每个位置 `pos` 会对应一组 sin/cos 角度，模型用这些角度旋转 query/key。旋转角度由位置和频率共同决定：
+
+```text
+angle(pos, dim) = pos * inv_freq(dim)
+```
+
+这样做的效果是：attention score 里会自然带上 token 之间的相对位置信息。预训练时模型只见过 8K 长度，所以原始 RoPE 频率主要在 0..8191 这个位置范围内被优化过。直接把位置推到 64K，角度会进入模型没怎么见过的区域，可能导致长距离 attention 表现不稳。
+
+长上下文扩展不是简单把 `max_sequence_length` 改成 65536；还要告诉 RoPE 如何在更长位置上产生“模型能接受”的角度。这里用的是 YaRN：
+
+```python
+YaRNRoPEScalingConfig(
+    factor=8,
+    beta_fast=32,
+    beta_slow=1,
+    old_context_len=8192,
+)
+```
+
+`factor=8` 的直觉是把位置尺度压缩 8 倍：64K 新上下文大约映射回 8K 旧上下文的频率范围。最朴素的插值可以理解成：
+
+```text
+inv_freq_scaled = inv_freq_original / 8
+angle_new(pos) = pos * inv_freq_scaled
+```
+
+这样位置 65536 对应的旋转角度，大致像原来位置 8192 附近的角度，模型更容易迁移。但纯粹把所有频率都除以 8 也有问题：高频维度负责短距离、细粒度位置信息，全部压缩可能伤害局部建模。
+
+YaRN 的做法是混合两套频率：
+
+```text
+extrapolation frequency = 原始 RoPE 频率
+interpolation frequency = 原始 RoPE 频率 / factor
+```
+
+然后用 `beta_fast` / `beta_slow` 控制一个线性 ramp：一部分高频维度更接近原始频率，保留短距离能力；一部分低频维度更接近缩放后的频率，负责支持更长上下文。代码里对应 `src/olmo_core/nn/rope.py::YaRNRoPEScalingConfig.compute_scaled_inv_freq()`：
+
+```text
+inv_freq = inv_freq_interpolation * ramp + inv_freq_extrapolation * (1 - ramp)
+```
+
+此外 YaRN 还会计算 `attention_rescale_factor = 0.1 * log(factor) + 1.0`，并把 sin/cos buffer 乘上这个系数，用来补偿上下文变长后 attention logit 尺度的变化。RoPE buffer 真正生成的位置在 `RotaryEmbedding._get_rotary_embedding()`：它根据新的 `seq_len=65536` 生成 sin/cos，再在 CP 开启时沿 sequence 维切给不同 CP rank。
+
+在 OLMo3 代码里，`.with_rope_scaling(...)` 默认只把 scaling 加到 full attention 层，而跳过 sliding-window attention 层。原因是 sliding-window 层本来只看局部窗口，例如 4096；真正需要跨越 64K 全局距离的是 full attention 层。
+
+#### 3.3.2 `doc_lens` / `cu_doc_lens` 是什么
+
+长上下文训练通常会把多个文档 pack 到一条固定长度样本里。比如一条 64K sequence 可能不是一个完整文档，而是多个文档拼起来：
+
+```text
+sample tokens:
+  [docA 12000 tokens][docB 8000 tokens][docC 45536 tokens]
+
+doc_lens:
+  [12000, 8000, 45536]
+
+cu_doc_lens:
+  [0, 12000, 20000, 65536]
+```
+
+`doc_lens` 就是 packed sample 内每个原始文档的长度。它来自数据集侧的 `generate_doc_lengths=True`，代码会根据 EOS/BOS 这类文档边界 token 调用 `get_document_lengths()` 计算。collator 会把 batch 内不同数量的文档长度 pad 到同一形状，并产生：
+
+```text
+batch["doc_lens"]
+batch["max_doc_lens"]
+```
+
+进入 `Transformer.forward()` 后，模型会调用 `get_cumulative_document_lengths(doc_lens)`，把每个文档长度转成累计边界 `cu_doc_lens`。`cu` 是 cumulative 的意思，即“累计长度”。attention 后端拿到这些边界后，就知道哪些 token 属于同一个文档，哪些 token 虽然在同一条 packed sequence 里但其实来自不同文档。
+
+为什么这很重要？如果不保留文档边界，模型可能会让 docB 的开头 token attend 到 docA 的结尾 token，好像它们是同一个连续文本。这对 packed training 来说是不合理的跨文档依赖。`cu_doc_lens` 让 attention/CP 能按文档边界做 intra-document masking：同一文档内正常 causal attention，不同文档之间避免错误连接。
+
+在 CP 场景下它还更关键。64K sequence 被切到 8 个 CP rank 后，一个文档可能跨 rank，文档边界也可能落在某个 rank 中间。CP load balancer 需要 `cu_doc_lens` 来正确切分输入和 RoPE buffer，并生成每个 rank 本地的文档边界信息，否则跨 rank attention 很难知道哪些位置属于同一文档。
 
 ## 4. 模型架构：报告参数如何落到代码
 

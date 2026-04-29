@@ -330,6 +330,14 @@ class SkipStepAdamWConfig(OptimConfig[SkipStepAdamW]):
     The number of standard deviations above the mean loss to skip a step.
     """
 
+    # 中文导读：@classmethod 表示这是“类方法”，调用时不需要先创建实例。
+    # Python 会把当前类本身作为第一个参数传进来，按惯例命名为 cls。
+    # 例如 SkipStepAdamWConfig.optimizer() 调用时，cls 就是 SkipStepAdamWConfig。
+    #
+    # 这里不用 self，是因为这个方法只回答一个固定问题：
+    # “这个 config 对应要构建哪个 optimizer 类？”答案就是 SkipStepAdamW。
+    # OptimConfig.build(model) 会调用 self.optimizer() 拿到这个类，
+    # 然后再实例化成真正的优化器对象。
     @classmethod
     def optimizer(cls) -> Type[SkipStepAdamW]:
         return SkipStepAdamW
